@@ -2,62 +2,66 @@ from pathlib import Path
 
 from bruteforce_canvas.generation import DEFAULT_SEED_BUNDLE
 from bruteforce_canvas.prompt import (
-    Element,
-    Evidence,
     EvidenceCategory,
-    Graph,
-    ObjectDescriptor,
-    PromptDocument,
+    EvidenceSpan,
+    ObjectLane,
+    PromptDocumentSpec,
+    SceneGraphDraft,
     VerificationIssue,
     VerificationReport,
 )
+from bruteforce_canvas.prompt_enums import ElementRole, EntityType, Importance
+from bruteforce_canvas.prompt_models import Element, ObjectDescriptor
 from bruteforce_canvas.runner import InMemoryRunEngine
 
 
-def approved_document() -> PromptDocument:
-    return PromptDocument(
-        prompt_document_id="doc_001",
+def approved_document() -> PromptDocumentSpec:
+    return PromptDocumentSpec(
         raw_user_prompt="a ceramic bowl on a wooden table",
-        seed_prompt="ceramic bowl on wooden table",
-        graph=Graph(
+        graph=SceneGraphDraft(
+            seed_prompt="ceramic bowl on wooden table",
             elements=[
                 Element(
-                    element_id="object_01",
+                    id="object_01",
                     label="bowl",
-                    entity_type="object",
-                    importance="primary",
-                    evidence=Evidence(text="ceramic bowl", category=EvidenceCategory.EXPLICIT),
+                    entity_type=EntityType.PRODUCT,
+                    role=ElementRole.PRIMARY_SUBJECT,
+                    importance=Importance.REQUIRED,
+                    evidence=EvidenceSpan(text="ceramic bowl", category=EvidenceCategory.EXPLICIT),
                 ),
                 Element(
-                    element_id="object_02",
+                    id="object_02",
                     label="table",
-                    entity_type="object",
-                    importance="supporting",
-                    evidence=Evidence(text="wooden table", category=EvidenceCategory.EXPLICIT),
+                    entity_type=EntityType.FURNITURE,
+                    role=ElementRole.SUPPORTING,
+                    importance=Importance.REQUIRED,
+                    evidence=EvidenceSpan(text="wooden table", category=EvidenceCategory.EXPLICIT),
                 ),
             ]
         ),
-        objects=[
-            ObjectDescriptor(element_id="object_01", field_name="material", raw_value="ceramic"),
-            ObjectDescriptor(element_id="object_02", field_name="material", raw_value="wooden"),
-        ],
+        object_lane=ObjectLane(
+            objects=[
+                ObjectDescriptor(target_id="object_01", material="ceramic"),
+                ObjectDescriptor(target_id="object_02", material="wooden"),
+            ]
+        ),
         verification=VerificationReport(approved=True, issues=[]),
     )
 
 
-def blocked_document() -> PromptDocument:
-    return PromptDocument(
-        prompt_document_id="doc_001",
+def blocked_document() -> PromptDocumentSpec:
+    return PromptDocumentSpec(
         raw_user_prompt="person throwing something",
-        seed_prompt="person throwing something",
-        graph=Graph(
+        graph=SceneGraphDraft(
+            seed_prompt="person throwing something",
             elements=[
                 Element(
-                    element_id="person_01",
+                    id="person_01",
                     label="person",
-                    entity_type="person",
-                    importance="primary",
-                    evidence=Evidence(text="person", category=EvidenceCategory.EXPLICIT),
+                    entity_type=EntityType.PERSON,
+                    role=ElementRole.PRIMARY_SUBJECT,
+                    importance=Importance.REQUIRED,
+                    evidence=EvidenceSpan(text="person", category=EvidenceCategory.EXPLICIT),
                 )
             ]
         ),

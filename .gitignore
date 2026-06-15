@@ -24,3 +24,4 @@ specs/
 *.md.swp
 *.md.swo
 *.md.tmp
+.sisyphus/

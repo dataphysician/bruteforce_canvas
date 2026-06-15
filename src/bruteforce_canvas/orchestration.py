@@ -35,6 +35,11 @@ class RunRuntimeState(StrEnum):
     BLOCKED = "blocked"
 
 
+class RuntimeGateState(StrictModel):
+    gates_passed: list[str] = Field(default_factory=list)
+    gates_failed: list[str] = Field(default_factory=list)
+
+
 class RunCounters(StrictModel):
     generated_count: int = 0
     iqa_evaluated_count: int = 0

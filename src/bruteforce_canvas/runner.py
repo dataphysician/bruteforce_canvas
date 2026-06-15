@@ -16,7 +16,14 @@ from bruteforce_canvas.learning import LearningEvent, LearningState, apply_coord
 from bruteforce_canvas.locking import apply_lock_overrides, build_default_lock_config
 from bruteforce_canvas.orchestration import CandidateState, RunConfig, apply_evaluation_disposition
 from bruteforce_canvas.persistence import PersistenceRecord
-from bruteforce_canvas.prompt import PromptDocument, render_prompt, target_manifest_from_prompt
+from bruteforce_canvas.prompt import (
+    PromptDocument,
+    render_prompt,
+    render_prompt_spec,
+    target_manifest_from_prompt,
+    target_manifest_from_prompt_spec,
+)
+from bruteforce_canvas.prompt_models import PromptDocumentSpec
 from bruteforce_canvas.router import AxisDomain, FieldState, LHSRouter, RouterInput, ThompsonArmState
 from bruteforce_canvas.shared import StrictModel
 
@@ -41,11 +48,17 @@ class InMemoryRunEngine:
         self,
         *,
         run_id: str,
-        document: PromptDocument,
+        document: PromptDocument | PromptDocumentSpec,
         quality_scores: list[float],
         alignment_scores: list[float],
     ) -> RunOnceResult:
-        config = RunConfig(run_id=run_id, raw_user_prompt=document.raw_user_prompt)
+        prompt_document_id = getattr(document, "prompt_document_id", "doc_001")
+        raw_user_prompt = (
+            document.raw_user_prompt or document.graph.seed_prompt
+            if isinstance(document, PromptDocumentSpec)
+            else document.raw_user_prompt
+        )
+        config = RunConfig(run_id=run_id, raw_user_prompt=raw_user_prompt)
         persisted: list[PersistenceRecord] = [
             PersistenceRecord(
                 record_id="rec_001",
@@ -61,14 +74,18 @@ class InMemoryRunEngine:
                     record_id="rec_002",
                     record_type="prompt_blocked",
                     run_id=run_id,
-                    prompt_document_id=document.prompt_document_id,
+                    prompt_document_id=prompt_document_id,
                     payload={"issues": [issue.model_dump() for issue in document.verification.issues]},
                 )
             )
             return RunOnceResult(persisted_records=persisted)
 
-        rendered = render_prompt(document)
-        manifest = target_manifest_from_prompt(run_id, rendered, document)
+        if isinstance(document, PromptDocumentSpec):
+            rendered = render_prompt_spec(document)
+            manifest = target_manifest_from_prompt_spec(document)
+        else:
+            rendered = render_prompt(document)
+            manifest = target_manifest_from_prompt(run_id, rendered, document)
         default_lock_config = build_default_lock_config(document)
         effective_lock_config = apply_lock_overrides(default_lock_config, [])
         persisted.extend(
@@ -77,14 +94,14 @@ class InMemoryRunEngine:
                     record_id="rec_002",
                     record_type="prompt_document",
                     run_id=run_id,
-                    prompt_document_id=document.prompt_document_id,
+                    prompt_document_id=prompt_document_id,
                     payload=document.model_dump(),
                 ),
                 PersistenceRecord(
                     record_id="rec_003",
                     record_type="target_manifest",
                     run_id=run_id,
-                    prompt_document_id=document.prompt_document_id,
+                    prompt_document_id=prompt_document_id,
                     target_manifest_id=manifest.manifest_id,
                     payload=manifest.model_dump(),
                 ),
@@ -92,14 +109,14 @@ class InMemoryRunEngine:
                     record_id="rec_004",
                     record_type="default_lock_config",
                     run_id=run_id,
-                    prompt_document_id=document.prompt_document_id,
+                    prompt_document_id=prompt_document_id,
                     payload=default_lock_config.model_dump(),
                 ),
                 PersistenceRecord(
                     record_id="rec_005",
                     record_type="effective_lock_config",
                     run_id=run_id,
-                    prompt_document_id=document.prompt_document_id,
+                    prompt_document_id=prompt_document_id,
                     payload=effective_lock_config.model_dump(),
                 ),
             ]
@@ -114,7 +131,7 @@ class InMemoryRunEngine:
         coordinate = router.propose(
             RouterInput(
                 run_id=run_id,
-                prompt_document_id=document.prompt_document_id,
+                prompt_document_id=prompt_document_id,
                 target_manifest_id=manifest.manifest_id,
                 fixed_arms=fixed_arms,
                 sampleable_axes={
@@ -128,7 +145,7 @@ class InMemoryRunEngine:
 
         generated = seed_sweep_requests(
             run_id=run_id,
-            prompt_document_id=document.prompt_document_id,
+            prompt_document_id=prompt_document_id,
             target_manifest_id=manifest.manifest_id,
             coordinate_id=coordinate.coordinate_id,
             rendered_prompt=rendered.rendered_prompt,
@@ -150,7 +167,7 @@ class InMemoryRunEngine:
                     record_id=f"rec_candidate_{index:03d}",
                     record_type="candidate_record",
                     run_id=run_id,
-                    prompt_document_id=document.prompt_document_id,
+                    prompt_document_id=prompt_document_id,
                     target_manifest_id=manifest.manifest_id,
                     coordinate_id=coordinate.coordinate_id,
                     candidate_id=candidate_id,
@@ -165,7 +182,7 @@ class InMemoryRunEngine:
                     seed=request.seed,
                     coordinate_id=coordinate.coordinate_id,
                     run_id=run_id,
-                    prompt_document_id=document.prompt_document_id,
+                    prompt_document_id=prompt_document_id,
                     target_manifest_id=manifest.manifest_id,
                     generation_settings=request.generation_settings.model_dump(),
                 )
@@ -175,7 +192,7 @@ class InMemoryRunEngine:
             EvaluationBatchRequest(
                 batch_id="batch_001",
                 run_id=run_id,
-                prompt_document_id=document.prompt_document_id,
+                prompt_document_id=prompt_document_id,
                 target_manifest_id=manifest.manifest_id,
                 batch_kind="seed_sweep",
                 coordinate_id=coordinate.coordinate_id,
@@ -197,7 +214,7 @@ class InMemoryRunEngine:
             candidate_state = CandidateState(
                 candidate_id=result.candidate_id or "cand_unknown",
                 run_id=run_id,
-                prompt_document_id=document.prompt_document_id,
+                prompt_document_id=prompt_document_id,
                 target_manifest_id=manifest.manifest_id,
                 coordinate_id=coordinate.coordinate_id,
                 seed=result.seed,
@@ -223,7 +240,7 @@ class InMemoryRunEngine:
                     record_id="rec_evaluation_aggregate",
                     record_type="evaluation_aggregate",
                     run_id=run_id,
-                    prompt_document_id=document.prompt_document_id,
+                    prompt_document_id=prompt_document_id,
                     target_manifest_id=manifest.manifest_id,
                     coordinate_id=coordinate.coordinate_id,
                     payload=evaluation.aggregate.model_dump(),
@@ -232,7 +249,7 @@ class InMemoryRunEngine:
                     record_id="rec_learning_delta",
                     record_type="learning_delta",
                     run_id=run_id,
-                    prompt_document_id=document.prompt_document_id,
+                    prompt_document_id=prompt_document_id,
                     target_manifest_id=manifest.manifest_id,
                     coordinate_id=coordinate.coordinate_id,
                     idempotency_key=f"eval:{coordinate.coordinate_id}",

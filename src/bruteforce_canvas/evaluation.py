@@ -6,7 +6,7 @@ from typing import Any, Literal
 
 from pydantic import Field, model_validator
 
-from bruteforce_canvas.generation import DEFAULT_SEED_BUNDLE
+from bruteforce_canvas.generation import DEFAULT_SEED_BUNDLE, MIN_SEED_BUNDLE_SIZE
 from bruteforce_canvas.prompt import EvaluationTargetManifest
 from bruteforce_canvas.shared import CandidateId, CoordinateId, DocId, RunId, StrictModel, TargetManifestId
 
@@ -974,8 +974,8 @@ def _outcome(promoted_count: int, failure_types: list[FailureType]) -> Literal["
 
 
 def aggregate_seed_sweep(results: list[ImageEvaluationResult]) -> CoordinateEvaluationAggregate:
-    if len(results) != len(DEFAULT_SEED_BUNDLE):
-        raise ValueError("coordinate aggregate requires the fixed five-seed result set")
+    if len(results) < MIN_SEED_BUNDLE_SIZE:
+        raise ValueError("coordinate aggregate requires at least 3 seed results")
     first = results[0]
     quality_scores = [result.quality.score for result in results]
     alignment_scores = [result.alignment.score for result in results]

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from bruteforce_canvas.evaluation import ImageEvaluationResult
-from bruteforce_canvas.generation import CandidateRecord, DEFAULT_SEED_BUNDLE
+from bruteforce_canvas.generation import MIN_SEED_BUNDLE_SIZE, CandidateRecord
 from bruteforce_canvas.prompt import PromptDocument, RenderedPrompt
+from bruteforce_canvas.prompt_models import PromptDocumentSpec
 from bruteforce_canvas.router import CandidateCoordinateBatch
 
 
@@ -12,7 +13,7 @@ class GateError(ValueError):
 
 class StageGate:
     @staticmethod
-    def prompt(document: PromptDocument) -> PromptDocument:
+    def prompt(document: PromptDocument | PromptDocumentSpec) -> PromptDocument | PromptDocumentSpec:
         if not document.verification.approved or any(issue.blocking for issue in document.verification.issues):
             raise GateError("PromptDocument verification did not pass")
         return document
@@ -39,8 +40,8 @@ class StageGate:
     ) -> list[CandidateRecord]:
         blocked_ids = infrastructure_blocked_candidate_ids or set()
         seeds = [candidate.seed for candidate in candidates]
-        if seeds != DEFAULT_SEED_BUNDLE:
-            raise GateError("generation gate requires the fixed five-seed bundle")
+        if len(seeds) < MIN_SEED_BUNDLE_SIZE:
+            raise GateError("seed bundle must contain at least 3 seeds")
         for candidate in candidates:
             if not candidate.file_valid and candidate.candidate_id not in blocked_ids:
                 raise GateError("generated artifact is not valid and not infrastructure-blocked")
@@ -49,8 +50,8 @@ class StageGate:
     @staticmethod
     def evaluation(results: list[ImageEvaluationResult]) -> list[ImageEvaluationResult]:
         seeds = [result.seed for result in results]
-        if seeds != DEFAULT_SEED_BUNDLE:
-            raise GateError("evaluation gate requires the fixed five-seed bundle")
+        if len(seeds) < MIN_SEED_BUNDLE_SIZE:
+            raise GateError("seed bundle must contain at least 3 seeds")
         required_ids = {
             (result.run_id, result.prompt_document_id, result.target_manifest_id, result.coordinate_id)
             for result in results

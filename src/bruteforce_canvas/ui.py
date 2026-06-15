@@ -9,6 +9,7 @@ from pydantic import Field, computed_field
 
 from bruteforce_canvas.locking import build_default_lock_config
 from bruteforce_canvas.prompt import PromptDocument
+from bruteforce_canvas.prompt_models import PromptDocumentSpec
 from bruteforce_canvas.shared import CandidateId, FeedbackAction, RunId, StrictModel
 
 
@@ -219,24 +220,43 @@ class DiagnosticsReadModel(StrictModel):
     recent_system_actions: list[dict[str, object]] = Field(default_factory=list)
 
 
-def pre_run_modal_from_prompt(document: PromptDocument) -> PreRunModalReadModel:
+def _prompt_document_id(document: PromptDocument | PromptDocumentSpec) -> str:
+    return getattr(document, "prompt_document_id", "doc_001")
+
+
+def _element_label(element: object) -> str:
+    element_id = getattr(element, "id", getattr(element, "element_id", "unknown_00"))
+    return f"{element_id}: {getattr(element, 'label')}"
+
+
+def _cinematography_editable_fields(document: PromptDocument | PromptDocumentSpec) -> list[str]:
+    if isinstance(document, PromptDocumentSpec):
+        return [
+            f"cinematography.{field}"
+            for field, value in document.cinematography_lane.model_dump().items()
+            if value is not None
+        ]
+    return [
+        field
+        for field, value in document.cinematography.model_dump().items()
+        if value is not None and field.endswith("_raw")
+    ]
+
+
+def pre_run_modal_from_prompt(document: PromptDocument | PromptDocumentSpec) -> PreRunModalReadModel:
     blocking_issues = [issue for issue in document.verification.issues if issue.blocking]
     state = PreRunModalState.BLOCKED if blocking_issues or not document.verification.approved else PreRunModalState.REVIEW
     lock_config = build_default_lock_config(document)
     return PreRunModalReadModel(
-        prompt_document_id=document.prompt_document_id,
+        prompt_document_id=_prompt_document_id(document),
         state=state,
         can_begin_generation=state != PreRunModalState.BLOCKED,
-        parsed_elements=[f"{element.element_id}: {element.label}" for element in document.graph.elements],
+        parsed_elements=[_element_label(element) for element in document.graph.elements],
         parsed_relations=[
             f"{relation.source_id} {relation.relation_raw} {relation.target_id}" for relation in document.graph.relations
         ],
         prompt_improvement_feedback=[issue.message for issue in blocking_issues],
-        editable_fields=[
-            field
-            for field, value in document.cinematography.model_dump().items()
-            if value is not None and field.endswith("_raw")
-        ],
+        editable_fields=_cinematography_editable_fields(document),
         lock_entries=[
             {
                 "field_path": entry.field_path,

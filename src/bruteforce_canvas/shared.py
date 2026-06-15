@@ -14,6 +14,8 @@ CandidateId = Annotated[str, StringConstraints(pattern=r"^cand_[A-Za-z0-9_]+$")]
 ElementId = Annotated[str, StringConstraints(pattern=r"^[a-z]+_[0-9]{2}$")]
 RelationId = Annotated[str, StringConstraints(pattern=r"^rel_[0-9]{2}$")]
 ShortText = Annotated[str, StringConstraints(min_length=1, max_length=180)]
+ResidualDescription = Annotated[str, StringConstraints(min_length=1, max_length=180)]
+SeedPrompt = Annotated[str, StringConstraints(min_length=1, max_length=500)]
 
 Confidence = Literal["high", "medium", "low"]
 

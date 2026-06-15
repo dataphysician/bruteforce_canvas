@@ -19,6 +19,7 @@ class LoopAction(StrEnum):
     GENERATE_PENDING_COORDINATE = "generate_pending_coordinate"
     EVALUATE_PENDING = "evaluate_pending"
     WAIT = "wait"
+    GATE_BLOCKED = "gate_blocked"
 
 
 class LoopDecision(StrictModel):

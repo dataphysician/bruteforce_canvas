@@ -13,6 +13,7 @@ from bruteforce_canvas.shared import CoordinateId, DocId, RunId, StrictModel, Ta
 
 
 DEFAULT_SEED_BUNDLE = [7, 42, 156, 8888, 42069]
+MIN_SEED_BUNDLE_SIZE = 3
 
 
 def generation_timestamp() -> str:

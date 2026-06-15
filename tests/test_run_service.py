@@ -2,6 +2,7 @@ from pathlib import Path
 
 from bruteforce_canvas.evaluation import EvaluationPlan, StaticIQAAdapter, StaticVLMAdapter
 from bruteforce_canvas.generation import GenerationSettings, StubGeneratorAdapter, seed_sweep_requests
+from bruteforce_canvas.loop import LoopAction
 from bruteforce_canvas.orchestration import FeedbackPolicyError, RunConfig, RunRuntimeState
 from bruteforce_canvas.persistence import JsonlEventStore, PersistenceRecord, reconstruct_run_state
 from bruteforce_canvas.run_service import RunService
@@ -300,3 +301,62 @@ def test_run_service_rejects_feedback_for_non_curated_candidate(tmp_path: Path):
         assert str(error) == "feedback is only accepted for promoted and curated candidates"
     else:
         raise AssertionError("expected FeedbackPolicyError")
+
+
+def test_run_service_invokes_gate_chain_during_tick_with_pending_work(tmp_path: Path):
+    run_service = service(tmp_path)
+    run_service.enqueue(work_item(tmp_path))
+
+    run_service.tick()
+
+    assert "rendering" in run_service._gate_state.gates_passed
+    assert run_service._gate_state.gates_failed == []
+
+
+def test_run_service_persists_gate_blocked_record_when_generation_gate_fails(tmp_path: Path):
+    run_service = service(tmp_path)
+    run_service.store.append(
+        PersistenceRecord(
+            record_id="candidate:cand_7",
+            record_type="candidate_record",
+            run_id="run_001",
+            prompt_document_id="doc_001",
+            target_manifest_id="eval_manifest_001",
+            coordinate_id="coord_001",
+            candidate_id="cand_7",
+            seed=7,
+            payload={
+                "candidate_id": "cand_7",
+                "run_id": "run_001",
+                "prompt_document_id": "doc_001",
+                "target_manifest_id": "eval_manifest_001",
+                "coordinate_id": "coord_001",
+                "seed": 7,
+                "rendered_prompt": "Generate a ceramic bowl on wooden table",
+                "generator_model_id": "stub",
+                "generator_backend": "stub",
+                "generation_settings": {},
+                "image_path": "/tmp/missing.png",
+                "file_valid": False,
+                "timestamp": "1970-01-01T00:00:00Z",
+                "generation_elapsed_ms": 0,
+            },
+        )
+    )
+    run_service.enqueue(work_item(tmp_path))
+
+    decision = run_service.tick()
+
+    assert decision.action == LoopAction.GATE_BLOCKED
+    assert decision.reason.startswith("generation_gate_blocked:")
+    assert decision.next_state == RunRuntimeState.RUNNING
+    assert run_service._gate_state.gates_failed == ["generation"]
+    gate_blocked_records = [
+        record for record in run_service.store.replay() if record.record_type == "gate_blocked"
+    ]
+    assert len(gate_blocked_records) == 1
+    payload = gate_blocked_records[0].payload
+    assert payload["gate"] == "generation"
+    assert payload["reason"].startswith("generation_gate_blocked:")
+    assert payload["gates_failed"] == ["generation"]
+    assert run_service.pending_count == 1

@@ -6,50 +6,37 @@ from bruteforce_canvas.locking import (
 )
 from bruteforce_canvas.prompt import (
     CanonicalEnum,
-    CinematographyLane,
-    Constraint,
-    Element,
-    Evidence,
     EvidenceCategory,
-    Graph,
-    ObjectDescriptor,
-    PromptDocument,
+    EvidenceSpan,
+    ConstraintLane,
+    ObjectLane,
+    PromptDocumentSpec,
+    SceneGraphDraft,
     VerificationReport,
 )
+from bruteforce_canvas.prompt_enums import ElementRole, EntityType, Guardrail, Importance, LightingMood
+from bruteforce_canvas.prompt_models import CinematographyLane, Element, ObjectDescriptor
 from bruteforce_canvas.shared import CanonicalStatus
 
 
-def document_with_canonical_fields() -> PromptDocument:
-    return PromptDocument(
-        prompt_document_id="doc_001",
+def document_with_canonical_fields() -> PromptDocumentSpec:
+    return PromptDocumentSpec(
         raw_user_prompt="a red ceramic bowl, no extra people",
-        seed_prompt="red ceramic bowl",
-        graph=Graph(
+        graph=SceneGraphDraft(
+            seed_prompt="red ceramic bowl",
             elements=[
                 Element(
-                    element_id="object_01",
+                    id="object_01",
                     label="bowl",
-                    entity_type="object",
-                    importance="primary",
-                    evidence=Evidence(text="bowl", category=EvidenceCategory.EXPLICIT),
+                    entity_type=EntityType.PRODUCT,
+                    role=ElementRole.PRIMARY_SUBJECT,
+                    importance=Importance.REQUIRED,
+                    evidence=EvidenceSpan(text="bowl", category=EvidenceCategory.EXPLICIT),
                 )
             ]
         ),
-        objects=[
-            ObjectDescriptor(
-                element_id="object_01",
-                field_name="color",
-                raw_value="red",
-                canonical=CanonicalEnum(
-                    raw_value="red",
-                    enum_value="RED",
-                    status=CanonicalStatus.MATCHED_ACTIVE,
-                    confidence="high",
-                    reason="clear color",
-                ),
-            )
-        ],
-        cinematography=CinematographyLane(lighting_raw="blue hour"),
+        object_lane=ObjectLane(objects=[ObjectDescriptor(target_id="object_01", color="red")]),
+        cinematography_lane=CinematographyLane(lighting_mood=LightingMood.BLUE_HOUR_TWILIGHT),
         canonical_metadata={
             "cinematography.lighting_mood": CanonicalEnum(
                 raw_value="blue hour",
@@ -59,14 +46,7 @@ def document_with_canonical_fields() -> PromptDocument:
                 reason="suppressed for active model context",
             )
         },
-        constraints=[
-            Constraint(
-                constraint_id="constraint.no_extra_people",
-                value_raw="no extra people",
-                negative=True,
-                evidence=Evidence(text="no extra people", category=EvidenceCategory.EXPLICIT),
-            )
-        ],
+        constraint_lane=ConstraintLane(guardrails=[Guardrail.NO_EXTRA_PEOPLE]),
         verification=VerificationReport(approved=True, issues=[]),
     )
 

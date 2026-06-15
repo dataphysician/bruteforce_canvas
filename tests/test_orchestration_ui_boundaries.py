@@ -11,17 +11,17 @@ from bruteforce_canvas.orchestration import (
     apply_evaluation_disposition,
 )
 from bruteforce_canvas.prompt import (
-    CinematographyLane,
-    Element,
-    Evidence,
     EvidenceCategory,
-    Graph,
-    ObjectDescriptor,
-    PromptDocument,
+    EvidenceSpan,
+    ObjectLane,
+    PromptDocumentSpec,
+    SceneGraphDraft,
     VerificationIssue,
     VerificationReport,
-    render_prompt,
+    render_prompt_spec,
 )
+from bruteforce_canvas.prompt_enums import ElementRole, EntityType, Importance, LightingMood
+from bruteforce_canvas.prompt_models import CinematographyLane, Element, ObjectDescriptor
 from bruteforce_canvas.shared import FeedbackAction
 from bruteforce_canvas.ui import (
     CandidateCard,
@@ -34,18 +34,18 @@ from bruteforce_canvas.ui import (
 
 
 def test_blocking_verification_prevents_rendering_and_begin_generation():
-    document = PromptDocument(
-        prompt_document_id="doc_001",
+    document = PromptDocumentSpec(
         raw_user_prompt="person throwing something",
-        seed_prompt="person throwing something",
-        graph=Graph(
+        graph=SceneGraphDraft(
+            seed_prompt="person throwing something",
             elements=[
                 Element(
-                    element_id="person_01",
+                    id="person_01",
                     label="person",
-                    entity_type="person",
-                    importance="primary",
-                    evidence=Evidence(text="person", category=EvidenceCategory.EXPLICIT),
+                    entity_type=EntityType.PERSON,
+                    role=ElementRole.PRIMARY_SUBJECT,
+                    importance=Importance.REQUIRED,
+                    evidence=EvidenceSpan(text="person", category=EvidenceCategory.EXPLICIT),
                 )
             ]
         ),
@@ -67,27 +67,27 @@ def test_blocking_verification_prevents_rendering_and_begin_generation():
     assert modal.can_begin_generation is False
     assert modal.prompt_improvement_feedback
     with pytest.raises(ValueError, match="unapproved"):
-        render_prompt(document)
+        render_prompt_spec(document)
 
 
 def test_pre_run_modal_exposes_backend_lock_configuration_without_graph_edit_controls():
-    document = PromptDocument(
-        prompt_document_id="doc_001",
+    document = PromptDocumentSpec(
         raw_user_prompt="a ceramic bowl in blue hour",
-        seed_prompt="ceramic bowl in blue hour",
-        graph=Graph(
+        graph=SceneGraphDraft(
+            seed_prompt="ceramic bowl in blue hour",
             elements=[
                 Element(
-                    element_id="object_01",
+                    id="object_01",
                     label="bowl",
-                    entity_type="object",
-                    importance="primary",
-                    evidence=Evidence(text="bowl", category=EvidenceCategory.EXPLICIT),
+                    entity_type=EntityType.PRODUCT,
+                    role=ElementRole.PRIMARY_SUBJECT,
+                    importance=Importance.REQUIRED,
+                    evidence=EvidenceSpan(text="bowl", category=EvidenceCategory.EXPLICIT),
                 )
             ]
         ),
-        objects=[ObjectDescriptor(element_id="object_01", field_name="material", raw_value="ceramic")],
-        cinematography=CinematographyLane(lighting_raw="blue hour"),
+        object_lane=ObjectLane(objects=[ObjectDescriptor(target_id="object_01", material="ceramic")]),
+        cinematography_lane=CinematographyLane(lighting_mood=LightingMood.BLUE_HOUR_TWILIGHT),
         verification=VerificationReport(approved=True, issues=[]),
     )
 

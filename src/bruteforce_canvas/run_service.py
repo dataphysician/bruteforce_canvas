@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import time
 from collections import deque
+from collections.abc import Callable
+from typing import Any
 
 from bruteforce_canvas.evaluation import ImageEvaluationResult
+from bruteforce_canvas.gates import GateError, StageGate
+from bruteforce_canvas.generation import CandidateRecord
 from bruteforce_canvas.loop import LoopAction, LoopDecision, next_loop_action
 from bruteforce_canvas.orchestration import (
     CandidateFeedbackResult,
@@ -11,11 +15,15 @@ from bruteforce_canvas.orchestration import (
     RunConfig,
     RunCounters,
     RunRuntimeState,
+    RuntimeGateState,
     RuntimeSnapshot,
     apply_candidate_feedback,
     build_stall_diagnostic,
 )
 from bruteforce_canvas.persistence import PERSISTENCE_VERSION, JsonlEventStore, PersistenceRecord, reconstruct_run_state
+from bruteforce_canvas.prompt import PromptDocument, RenderedPrompt
+from bruteforce_canvas.prompt_models import PromptDocumentSpec
+from bruteforce_canvas.router import CandidateCoordinateBatch
 from bruteforce_canvas.shared import FeedbackAction
 from bruteforce_canvas.telemetry import measure_vram_gib
 from bruteforce_canvas.ui import UIEvent
@@ -37,6 +45,7 @@ class RunService:
         self._state = RunRuntimeState.RUNNING
         self._stop_requested = False
         self._transition_counter = 0
+        self._gate_state = RuntimeGateState()
 
     @property
     def pending_count(self) -> int:
@@ -178,11 +187,97 @@ class RunService:
         self._persist_transition(decision)
         if decision.reason == "stall_guard":
             self._persist_stall_diagnostic(counters)
-        self._state = decision.next_state
         if decision.action == LoopAction.GENERATE_PENDING_COORDINATE and self._pending:
+            gate_decision = self._run_gate_chain()
+            if gate_decision is not None:
+                self._persist_gate_blocked(gate_decision)
+                return gate_decision
+            self._state = decision.next_state
             item = self._pending.popleft()
             self.worker.run_seed_sweep(item)
+            return decision
+        self._state = decision.next_state
         return decision
+
+    def _run_gate_chain(self) -> LoopDecision | None:
+        gate_specs: list[tuple[str, Callable[[], Any]]] = [
+            ("prompt", self._gate_prompt_input),
+            ("router", self._gate_router_input),
+            ("rendering", self._gate_rendering_input),
+            ("generation", self._gate_generation_input),
+            ("evaluation", self._gate_evaluation_input),
+        ]
+        for gate_name, get_input in gate_specs:
+            gate_input = get_input()
+            if gate_input is None:
+                continue
+            try:
+                if gate_name == "prompt":
+                    StageGate.prompt(gate_input)
+                elif gate_name == "router":
+                    StageGate.router(gate_input)
+                elif gate_name == "rendering":
+                    StageGate.rendering(gate_input)
+                elif gate_name == "generation":
+                    StageGate.generation(gate_input)
+                elif gate_name == "evaluation":
+                    StageGate.evaluation(gate_input)
+                self._gate_state.gates_passed.append(gate_name)
+            except GateError as exc:
+                self._gate_state.gates_failed.append(gate_name)
+                return LoopDecision(
+                    action=LoopAction.GATE_BLOCKED,
+                    reason=f"{gate_name}_gate_blocked:{exc}",
+                    next_state=self._state,
+                )
+        return None
+
+    def _gate_prompt_input(self) -> PromptDocument | PromptDocumentSpec | None:
+        for record in reversed(self.store.replay()):
+            if record.record_type == "prompt_document":
+                try:
+                    return PromptDocument.model_validate(record.payload)
+                except Exception:
+                    try:
+                        return PromptDocumentSpec.model_validate(record.payload)
+                    except Exception:
+                        return None
+        return None
+
+    def _gate_router_input(self) -> CandidateCoordinateBatch | None:
+        return None
+
+    def _gate_rendering_input(self) -> RenderedPrompt | None:
+        if not self._pending:
+            return None
+        item = self._pending[0]
+        return RenderedPrompt(
+            prompt_document_id=item.generation_requests[0].prompt_document_id
+            if item.generation_requests
+            else "doc_unknown",
+            rendered_prompt=item.rendered_prompt,
+            rendering_trace=[],
+        )
+
+    def _gate_generation_input(self) -> list[CandidateRecord] | None:
+        candidates: list[CandidateRecord] = []
+        for record in self.store.replay():
+            if record.record_type == "candidate_record":
+                try:
+                    candidates.append(CandidateRecord.model_validate(record.payload))
+                except Exception:
+                    continue
+        return candidates if candidates else None
+
+    def _gate_evaluation_input(self) -> list[ImageEvaluationResult] | None:
+        results: list[ImageEvaluationResult] = []
+        for record in self.store.replay():
+            if record.record_type == "image_evaluation":
+                try:
+                    results.append(ImageEvaluationResult.model_validate(record.payload))
+                except Exception:
+                    continue
+        return results if results else None
 
     def _counters_from_store(self) -> RunCounters:
         records = self.store.replay()
@@ -247,6 +342,26 @@ class RunService:
                     "action": str(decision.action),
                     "reason": decision.reason,
                     "next_state": str(decision.next_state),
+                },
+            )
+        )
+
+    def _persist_gate_blocked(self, decision: LoopDecision) -> None:
+        self._transition_counter += 1
+        gate_name = decision.reason.split("_gate_blocked", 1)[0]
+        self.store.append(
+            PersistenceRecord(
+                record_id=f"gate_blocked:{self._transition_counter}",
+                record_type="gate_blocked",
+                run_id=self.config.run_id,
+                idempotency_key=f"gate_blocked:{self._transition_counter}",
+                payload={
+                    "gate": gate_name,
+                    "reason": decision.reason,
+                    "next_state": str(decision.next_state),
+                    "gates_passed": list(self._gate_state.gates_passed),
+                    "gates_failed": list(self._gate_state.gates_failed),
+                    "persistence_version": PERSISTENCE_VERSION,
                 },
             )
         )
