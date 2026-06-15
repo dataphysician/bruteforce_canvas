@@ -195,13 +195,18 @@ class RunWorkspaceReadModel(StrictModel):
     shredded_count: int
     stall_guard_state: str
     notification: str
+    error_state: str | None = None
+    diagnostic_hold_enums: list[str] = Field(default_factory=list)
+    suppressed_enums: list[str] = Field(default_factory=list)
+    proposed_enums: list[str] = Field(default_factory=list)
+    raw_ood_signals: list[str] = Field(default_factory=list)
     elapsed_seconds: int = 0
     vram_telemetry: list[VRAMTelemetry] = Field(default_factory=list)
 
     @computed_field
     @property
     def progress_heartbeat(self) -> dict[str, object]:
-        return {
+        heartbeat: dict[str, object] = {
             "run_state": self.run_state,
             "generated_count": self.generated_count,
             "iqa_evaluated_count": self.iqa_evaluated_count,
@@ -214,6 +219,9 @@ class RunWorkspaceReadModel(StrictModel):
             "elapsed_seconds": self.elapsed_seconds,
             "vram_telemetry": [item.model_dump() for item in self.vram_telemetry],
         }
+        if self.error_state is not None:
+            heartbeat["error_state"] = self.error_state
+        return heartbeat
 
 
 class DiagnosticsReadModel(StrictModel):

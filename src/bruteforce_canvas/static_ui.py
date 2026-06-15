@@ -12,8 +12,11 @@ from bruteforce_canvas.ui import (
 )
 
 
-def _button(label: str, action: str) -> str:
-    return f'<button type="button" data-action="{escape(action)}">{escape(label)}</button>'
+def _button(label: str, action: str, extra: str = "") -> str:
+    attrs = f' type="button" data-action="{escape(action)}"'
+    if extra:
+        attrs += " " + extra
+    return f"<button{attrs}>{escape(label)}</button>"
 
 
 def _catalogue(cards: list[CandidateCard]) -> str:
@@ -169,6 +172,56 @@ def _diagnostics(diagnostics: DiagnosticsReadModel | None) -> str:
     )
 
 
+_ERROR_STATE_MESSAGES: dict[str, str] = {
+    "no_prompt": "No prompt was provided.",
+    "parse_blocked": "Prompt parsing is blocked.",
+    "no_curated_images": "No curated images are available.",
+    "all_seeds_failed": "All seeds failed to generate.",
+    "generator_unavailable": "The image generator is unavailable.",
+    "evaluator_unavailable": "The evaluator is unavailable.",
+    "stalled": "Generation has stalled.",
+}
+
+
+def _error_state(workspace: RunWorkspaceReadModel) -> str:
+    if workspace.error_state is None:
+        return ""
+    message = _ERROR_STATE_MESSAGES.get(
+        workspace.error_state,
+        f"Unknown error state: {workspace.error_state}",
+    )
+    return (
+        '<div data-region="error-state"'
+        + f' data-error-state="{escape(workspace.error_state)}">'
+        + f"<p>{escape(message)}</p>"
+        + "</div>"
+    )
+
+
+def _advanced_view(workspace: RunWorkspaceReadModel) -> str:
+    if (
+        not workspace.diagnostic_hold_enums
+        and not workspace.suppressed_enums
+        and not workspace.proposed_enums
+        and not workspace.raw_ood_signals
+    ):
+        return '<div id="advanced-view" hidden><section data-region="diagnostic-hold-enums"><h3>Diagnostic hold enums</h3><ul></ul></section><section data-region="suppressed-enums"><h3>Suppressed enums</h3><ul></ul></section><section data-region="proposed-enums"><h3>Proposed enums</h3><ul></ul></section><section data-region="raw-ood-signals"><h3>Raw OOD signals</h3><ul></ul></section></div>'
+    diagnostic_hold = "".join(
+        f"<li>{escape(item)}</li>" for item in workspace.diagnostic_hold_enums
+    )
+    suppressed = "".join(f"<li>{escape(item)}</li>" for item in workspace.suppressed_enums)
+    proposed = "".join(f"<li>{escape(item)}</li>" for item in workspace.proposed_enums)
+    ood = "".join(f"<li>{escape(item)}</li>" for item in workspace.raw_ood_signals)
+    return (
+        '<div id="advanced-view" hidden>'
+        + f'<section data-region="diagnostic-hold-enums"><h3>Diagnostic hold enums</h3><ul>{diagnostic_hold}</ul></section>'
+        + f'<section data-region="suppressed-enums"><h3>Suppressed enums</h3><ul>{suppressed}</ul></section>'
+        + f'<section data-region="proposed-enums"><h3>Proposed enums</h3><ul>{proposed}</ul></section>'
+        + f'<section data-region="raw-ood-signals"><h3>Raw OOD signals</h3><ul>{ood}</ul></section>'
+        + "</div>"
+    )
+
+
 def _pre_run_modal(modal: PreRunModalReadModel | None) -> str:
     if modal is None:
         return ""
@@ -221,8 +274,17 @@ def render_workspace_html(
     diagnostics: DiagnosticsReadModel | None = None,
     pre_run_modal: PreRunModalReadModel | None = None,
 ) -> str:
+    advanced_toggle = (
+        _button(
+            "Advanced",
+            "toggle-advanced",
+            'id="advanced-toggle" aria-pressed="false" aria-label="Toggle advanced view"',
+        )
+        + '\n        '
+    )
     controls = (
         '<nav data-region="run-controls">'
+        + advanced_toggle
         + _button("Start", "start")
         + _button("Pause", "pause")
         + _button("Stop", "stop")
@@ -237,6 +299,19 @@ def render_workspace_html(
     notification = (
         f'<div data-region="notification">{escape(workspace.notification)}</div>'
     )
+    script = """
+    <script>
+    document.addEventListener('click', function(event) {
+        var button = event.target.closest('button[data-action="toggle-advanced"]');
+        if (!button) return;
+        var advancedView = document.getElementById('advanced-view');
+        if (!advancedView) return;
+        var pressed = button.getAttribute('aria-pressed') === 'true';
+        button.setAttribute('aria-pressed', String(!pressed));
+        advancedView.hidden = pressed;
+    });
+    </script>
+    """
     return (
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>Bruteforce Canvas</title></head>"
         "<body>"
@@ -246,7 +321,10 @@ def render_workspace_html(
         + _catalogue(catalogue)
         + _detail(selected)
         + _progress(workspace)
+        + _error_state(workspace)
         + notification
         + _diagnostics(diagnostics)
+        + _advanced_view(workspace)
+        + script
         + "</body></html>"
     )

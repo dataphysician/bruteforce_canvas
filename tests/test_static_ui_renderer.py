@@ -1,3 +1,5 @@
+import pytest
+
 from bruteforce_canvas.static_ui import render_workspace_html
 from bruteforce_canvas.ui import (
     CandidateCard,
@@ -276,5 +278,91 @@ def test_static_workspace_html_escapes_user_supplied_text():
     unsafe = workspace().model_copy(update={"raw_user_prompt": "<script>alert(1)</script>"})
     html = render_workspace_html(unsafe, catalogue=[], selected=None)
 
-    assert "<script>" not in html
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html
+    assert "<script>alert(1)</script>" not in html
+
+
+def test_static_workspace_html_has_advanced_toggle_button():
+    html = render_workspace_html(
+        workspace(),
+        catalogue=[CandidateCard(candidate_id="cand_7", promoted=True, curated=True, seed=7)],
+        selected=detail(),
+    )
+
+    assert 'id="advanced-toggle"' in html
+    assert 'data-action="toggle-advanced"' in html
+    assert 'aria-pressed="false"' in html
+    assert 'aria-label="Toggle advanced view"' in html
+
+
+def test_static_workspace_html_advanced_view_hidden_and_subregions_exist_when_populated():
+    populated = workspace().model_copy(
+        update={
+            "diagnostic_hold_enums": ["arm_x"],
+            "suppressed_enums": ["arm_y"],
+            "proposed_enums": ["arm_z"],
+            "raw_ood_signals": ["signal_1"],
+        }
+    )
+    html = render_workspace_html(
+        populated,
+        catalogue=[CandidateCard(candidate_id="cand_7", promoted=True, curated=True, seed=7)],
+        selected=detail(),
+    )
+
+    assert 'id="advanced-view"' in html
+    assert 'hidden' in html
+    assert 'data-region="diagnostic-hold-enums"' in html
+    assert 'data-region="suppressed-enums"' in html
+    assert 'data-region="proposed-enums"' in html
+    assert 'data-region="raw-ood-signals"' in html
+
+
+def test_static_workspace_html_advanced_view_hidden_when_empty():
+    html = render_workspace_html(
+        workspace(),
+        catalogue=[CandidateCard(candidate_id="cand_7", promoted=True, curated=True, seed=7)],
+        selected=detail(),
+    )
+
+    assert 'id="advanced-view"' in html
+    assert 'hidden' in html
+
+
+@pytest.mark.parametrize(
+    "error_state",
+    [
+        "no_prompt",
+        "parse_blocked",
+        "no_curated_images",
+        "all_seeds_failed",
+        "generator_unavailable",
+        "evaluator_unavailable",
+        "stalled",
+    ],
+)
+def test_static_workspace_html_renders_error_state(error_state: str):
+    model = workspace().model_copy(update={"error_state": error_state})
+    html = render_workspace_html(
+        model,
+        catalogue=[CandidateCard(candidate_id="cand_7", promoted=True, curated=True, seed=7)],
+        selected=detail(),
+    )
+
+    assert 'data-region="error-state"' in html
+    assert f'data-error-state="{error_state}"' in html
+
+
+def test_static_workspace_html_contains_advanced_toggle_vanilla_js():
+    html = render_workspace_html(
+        workspace(),
+        catalogue=[CandidateCard(candidate_id="cand_7", promoted=True, curated=True, seed=7)],
+        selected=detail(),
+    )
+
+    assert "<script>" in html
+    assert "advanced-toggle" in html
+    assert "advanced-view" in html
+    assert "aria-pressed" in html
+    assert "hidden" in html
+    assert "toggle-advanced" in html
