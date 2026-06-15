@@ -73,6 +73,25 @@ def test_locked_required_miss_fails_alignment_and_localizes_locked_blame():
     assert result.disposition_signal.class_name == "fail_persist_for_learning"
 
 
+def test_medium_confidence_required_miss_warns_without_hard_alignment_failure():
+    result = apply_target_observations(
+        AlignmentEvaluation(score=0.8),
+        manifest(),
+        [
+            TargetObservation(target_id="object_01", present=True, confidence="high"),
+            TargetObservation(target_id="object_01.material", present=False, confidence="medium"),
+            TargetObservation(target_id="cinematography.shot_size", present=True, confidence="high"),
+            TargetObservation(target_id="constraint.no_extra_people", present=False, confidence="high"),
+        ],
+    )
+
+    assert result.pass_flags["alignment"] is True
+    assert result.failure_types == ["wrong_material"]
+    assert result.localized_blame[0].source == "locked"
+    assert result.localized_blame[0].confidence == "medium"
+    assert result.disposition_signal.class_name == "passes_thresholds"
+
+
 def test_sampled_should_match_miss_adds_sampled_blame_without_hard_failure():
     result = apply_target_observations(
         AlignmentEvaluation(score=0.8),

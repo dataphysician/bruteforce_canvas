@@ -335,7 +335,7 @@ def apply_target_observations(
                 reason=observation.reason or f"{target.target_id} was not observed",
             )
         )
-        if target.evaluation_policy == "must_match":
+        if target.evaluation_policy == "must_match" and observation.confidence == "high":
             hard_failure = True
 
     for target in manifest.negative_targets:
@@ -354,7 +354,7 @@ def apply_target_observations(
                 reason=observation.reason or f"{target.target_id} appeared despite negative guard",
             )
         )
-        if target.evaluation_policy == "must_not_appear":
+        if target.evaluation_policy == "must_not_appear" and observation.confidence == "high":
             hard_failure = True
 
     alignment_pass = alignment.score >= 0.0 and not hard_failure
