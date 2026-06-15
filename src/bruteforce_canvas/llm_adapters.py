@@ -4,13 +4,16 @@ from typing import Protocol
 
 from pydantic import Field
 
-from bruteforce_canvas.prompt import CanonicalEnum, PromptDocument, VerificationIssue, VerificationReport
+from bruteforce_canvas.prompt import CanonicalEnum, VerificationIssue, VerificationReport
+from bruteforce_canvas.prompt_models import PromptDocumentSpec
 from bruteforce_canvas.shared import StrictModel
+from bruteforce_canvas.validation import RetryRequest
 
 
 class JsonLLMClient(Protocol):
     def generate_json(self, *, system: str, user: dict, schema_name: str) -> dict:
         """Return JSON-compatible data for the requested schema."""
+        ...
 
 
 class FieldEnumContext(StrictModel):
@@ -23,16 +26,16 @@ class LLMPromptExtractionAdapter:
     def __init__(self, client: JsonLLMClient) -> None:
         self.client = client
 
-    def extract(self, raw_prompt: str) -> PromptDocument:
+    def extract(self, raw_prompt: str) -> PromptDocumentSpec:
         payload = self.client.generate_json(
             system=(
-                "Extract a graph-first PromptDocument from the raw prompt with no rule-based fallback. "
+                "Extract a graph-first PromptDocumentSpec from the raw prompt with no rule-based fallback. "
                 "Preserve raw user wording, evidence spans, lane ownership, and unresolved slots."
             ),
             user={"raw_prompt": raw_prompt},
-            schema_name="PromptDocument",
+            schema_name="PromptDocumentSpec",
         )
-        return PromptDocument.model_validate(payload)
+        return PromptDocumentSpec.model_validate(payload, strict=False)
 
 
 class LLMCanonicalizerAdapter:
@@ -66,7 +69,7 @@ class LLMVerificationAdapter:
     def __init__(self, client: JsonLLMClient) -> None:
         self.client = client
 
-    def verify(self, document: PromptDocument) -> VerificationReport:
+    def verify(self, document: PromptDocumentSpec) -> VerificationReport:
         payload = self.client.generate_json(
             system=(
                 "Verify graph linkage, lane ownership, enum fit, unresolved slots, prompt faithfulness, "
@@ -85,7 +88,16 @@ class LLMRepairAdapter:
     def __init__(self, client: JsonLLMClient) -> None:
         self.client = client
 
-    def repair(self, document: PromptDocument, issue: VerificationIssue) -> PromptDocument:
+    def repair(self, document: PromptDocumentSpec, issue: RetryRequest | VerificationIssue) -> PromptDocumentSpec:
+        if isinstance(issue, RetryRequest):
+            repair_scope = issue.issues[0].retry_scope if issue.issues else issue.failed_stage
+            issue_payload = issue.model_dump()
+            instruction = issue.instruction
+        else:
+            repair_scope = issue.repair_scope
+            issue_payload = issue.model_dump()
+            instruction = "Repair the verifier issue while preserving unrelated lanes."
+
         payload = self.client.generate_json(
             system=(
                 "Repair only the slice named by repair_scope. Preserve stable IDs, raw user language, "
@@ -93,10 +105,11 @@ class LLMRepairAdapter:
             ),
             user={
                 "prompt_document_id": document.prompt_document_id,
-                "repair_scope": issue.repair_scope,
-                "issue": issue.model_dump(),
+                "repair_scope": repair_scope,
+                "issue": issue_payload,
+                "instruction": instruction,
                 "document": document.model_dump(),
             },
-            schema_name="PromptDocumentRepair",
+            schema_name="PromptDocumentSpecRepair",
         )
-        return PromptDocument.model_validate(payload)
+        return PromptDocumentSpec.model_validate(payload, strict=False)

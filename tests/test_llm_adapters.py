@@ -6,15 +6,16 @@ from bruteforce_canvas.llm_adapters import (
     LLMVerificationAdapter,
 )
 from bruteforce_canvas.prompt import (
-    Element,
-    Evidence,
     EvidenceCategory,
-    Graph,
-    ObjectDescriptor,
-    PromptDocument,
+    EvidenceSpan,
+    ObjectLane,
+    PromptDocumentSpec,
+    SceneGraphDraft,
     VerificationIssue,
     VerificationReport,
 )
+from bruteforce_canvas.prompt_enums import ElementRole, EntityType, Importance
+from bruteforce_canvas.prompt_models import Element, ObjectDescriptor
 from bruteforce_canvas.shared import CanonicalStatus
 
 
@@ -32,45 +33,46 @@ def prompt_document_payload() -> dict:
     return {
         "prompt_document_id": "doc_001",
         "raw_user_prompt": "a ceramic bowl on a wooden table",
-        "seed_prompt": "ceramic bowl on wooden table",
         "graph": {
+            "seed_prompt": "ceramic bowl on wooden table",
             "elements": [
                 {
-                    "element_id": "object_01",
+                    "id": "object_01",
                     "label": "bowl",
-                    "entity_type": "object",
-                    "importance": "primary",
+                    "entity_type": "product",
+                    "role": "primary_subject",
+                    "importance": "required",
                     "evidence": {"text": "ceramic bowl", "category": "explicit"},
                 }
             ],
             "relations": [],
         },
-        "objects": [{"element_id": "object_01", "field_name": "material", "raw_value": "ceramic"}],
-        "actions": [],
-        "cinematography": {},
-        "constraints": [],
+        "object_lane": {"objects": [{"target_id": "object_01", "material": "ceramic"}]},
+        "action_lane": {"actions": []},
+        "cinematography_lane": {},
+        "constraint_lane": {},
         "canonical_metadata": {},
         "verification": {"approved": False, "issues": []},
     }
 
 
-def document() -> PromptDocument:
-    return PromptDocument(
-        prompt_document_id="doc_001",
+def document() -> PromptDocumentSpec:
+    return PromptDocumentSpec(
         raw_user_prompt="a ceramic bowl on a wooden table",
-        seed_prompt="ceramic bowl on wooden table",
-        graph=Graph(
+        graph=SceneGraphDraft(
+            seed_prompt="ceramic bowl on wooden table",
             elements=[
                 Element(
-                    element_id="object_01",
+                    id="object_01",
                     label="bowl",
-                    entity_type="object",
-                    importance="primary",
-                    evidence=Evidence(text="ceramic bowl", category=EvidenceCategory.EXPLICIT),
+                    entity_type=EntityType.PRODUCT,
+                    role=ElementRole.PRIMARY_SUBJECT,
+                    importance=Importance.REQUIRED,
+                    evidence=EvidenceSpan(text="ceramic bowl", category=EvidenceCategory.EXPLICIT),
                 )
             ]
         ),
-        objects=[ObjectDescriptor(element_id="object_01", field_name="material", raw_value="ceramic")],
+        object_lane=ObjectLane(objects=[ObjectDescriptor(target_id="object_01", material="ceramic")]),
         verification=VerificationReport(approved=False, issues=[]),
     )
 
@@ -82,7 +84,7 @@ def test_llm_extraction_adapter_validates_prompt_document_and_preserves_raw_prom
     result = adapter.extract("a ceramic bowl on a wooden table")
 
     assert result.raw_user_prompt == "a ceramic bowl on a wooden table"
-    assert client.calls[0]["schema_name"] == "PromptDocument"
+    assert client.calls[0]["schema_name"] == "PromptDocumentSpec"
     assert client.calls[0]["user"]["raw_prompt"] == "a ceramic bowl on a wooden table"
     assert "no rule-based fallback" in client.calls[0]["system"]
 
@@ -136,11 +138,11 @@ def test_llm_repair_adapter_sends_slice_scope_and_returns_repaired_document():
         message="material assigned to wrong object",
     )
     payload = prompt_document_payload()
-    payload["objects"] = [{"element_id": "object_01", "field_name": "material", "raw_value": "ceramic"}]
+    payload["object_lane"] = {"objects": [{"target_id": "object_01", "material": "ceramic"}]}
     client = FakeJsonClient([payload])
 
     result = LLMRepairAdapter(client).repair(document(), issue)
 
     assert result.prompt_document_id == "doc_001"
-    assert client.calls[0]["schema_name"] == "PromptDocumentRepair"
+    assert client.calls[0]["schema_name"] == "PromptDocumentSpecRepair"
     assert client.calls[0]["user"]["repair_scope"] == "object_descriptor"
