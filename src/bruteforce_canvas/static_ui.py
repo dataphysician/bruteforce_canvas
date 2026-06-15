@@ -12,10 +12,25 @@ from bruteforce_canvas.ui import (
 )
 
 
-def _button(label: str, action: str, extra: str = "") -> str:
-    attrs = f' type="button" data-action="{escape(action)}"'
+def _button(
+    label: str,
+    action: str,
+    extra: str = "",
+    *,
+    aria_label: str = "",
+    disabled: bool = False,
+    data_feedback: str = "",
+) -> str:
+    parts = [f' type="button" data-action="{escape(action)}"']
+    if data_feedback:
+        parts.append(f' data-feedback="{escape(data_feedback)}"')
     if extra:
-        attrs += " " + extra
+        parts.append(" " + extra)
+    if disabled:
+        parts.append(" disabled")
+    if aria_label:
+        parts.append(f' aria-label="{escape(aria_label)}"')
+    attrs = "".join(parts)
     return f"<button{attrs}>{escape(label)}</button>"
 
 
@@ -42,12 +57,35 @@ def _catalogue(cards: list[CandidateCard]) -> str:
             + str(card.curated).lower()
             + '" data-feedback-state="'
             + escape(feedback)
+            + '"'
+            + ' role="button"'
+            + ' tabindex="0"'
+            + ' aria-label="Candidate '
+            + escape(card.candidate_id)
             + '">'
             + thumbnail
             + f"<strong>{escape(card.candidate_id)}</strong>{escape(seed)}"
             + "</article>"
         )
-    return '<section data-region="catalogue"><h2>Catalogue</h2>' + "".join(items) + "</section>"
+    catalogue = (
+        '<section class="candidate-catalogue" data-region="catalogue">'
+        + "<h2>Catalogue</h2>"
+        + "".join(items)
+        + "</section>"
+    )
+    zoom_controls = (
+        '<div class="zoom-controls">'
+        + _button("+", "zoom-in", aria_label="Zoom in")
+        + _button("−", "zoom-out", aria_label="Zoom out")
+        + _button("Reset", "zoom-reset", aria_label="Reset zoom")
+        + "</div>"
+    )
+    return (
+        '<div class="catalogue-viewport">'
+        + zoom_controls
+        + catalogue
+        + "</div>"
+    )
 
 
 def _detail(selected: DetailReport | None) -> str:
@@ -98,20 +136,20 @@ def _detail(selected: DetailReport | None) -> str:
         feedback = (
             '<div data-region="feedback-controls" data-feedback-pending="true">'
             f'<p>Feedback pending: {escape(pending)}</p>'
-            '<button type="button" data-feedback="accept" disabled>Accept</button>'
-            '<button type="button" data-feedback="reject" disabled>Reject</button>'
-            '<button type="button" data-feedback="shred" disabled>Shred</button>'
-            "</div>"
+            + _button("Accept", "feedback-accept", data_feedback="accept", disabled=True, aria_label="Accept selected image")
+            + _button("Reject", "feedback-reject", data_feedback="reject", disabled=True, aria_label="Reject selected image")
+            + _button("Shred", "feedback-shred", data_feedback="shred", disabled=True, aria_label="Shred selected image")
+            + "</div>"
         )
     elif selected.feedback_state is not None:
         feedback = f'<div data-region="feedback-state">Feedback: {escape(selected.feedback_state)}</div>'
     else:
         feedback = (
             '<div data-region="feedback-controls">'
-            '<button type="button" data-feedback="accept">Accept</button>'
-            '<button type="button" data-feedback="reject">Reject</button>'
-            '<button type="button" data-feedback="shred">Shred</button>'
-            "</div>"
+            + _button("Accept", "feedback-accept", data_feedback="accept", aria_label="Accept selected image")
+            + _button("Reject", "feedback-reject", data_feedback="reject", aria_label="Reject selected image")
+            + _button("Shred", "feedback-shred", data_feedback="shred", aria_label="Shred selected image")
+            + "</div>"
         )
     return (
         '<section data-region="image-detail">'
@@ -141,7 +179,13 @@ def _progress(workspace: RunWorkspaceReadModel) -> str:
     items = "".join(
         f"<li>{escape(str(key))}: {escape(str(value))}</li>" for key, value in heartbeat.items()
     )
-    return f'<footer data-region="progress-heartbeat"><ul>{items}</ul></footer>'
+    return (
+        '<footer data-region="progress-heartbeat"'
+        + ' aria-live="polite"'
+        + ' aria-label="Progress heartbeat">'
+        + f"<ul>{items}</ul>"
+        + "</footer>"
+    )
 
 
 def _diagnostics(diagnostics: DiagnosticsReadModel | None) -> str:
@@ -245,7 +289,7 @@ def _pre_run_modal(modal: PreRunModalReadModel | None) -> str:
         + "</li>"
         for entry in modal.lock_entries
     )
-    begin = _button("Begin Generation", "begin-generation") if modal.can_begin_generation else ""
+    begin = _button("Begin Generation", "begin-generation", aria_label="Begin generation") if modal.can_begin_generation else ""
     return (
         '<section data-region="pre-run-modal" data-modal-state="'
         + escape(str(modal.state))
@@ -259,9 +303,9 @@ def _pre_run_modal(modal: PreRunModalReadModel | None) -> str:
         f'<ul data-region="prompt-improvement-feedback">{feedback}</ul>'
         f'<ul data-region="editable-fluid-fields">{editable_fields}</ul>'
         f'<ul data-region="lock-controls">{lock_entries}</ul>'
-        + _button("Advanced", "toggle-advanced-pre-run")
+        + _button("Advanced", "toggle-advanced-pre-run", aria_label="Toggle advanced pre-run view")
         + begin
-        + _button("Cancel", "cancel-pre-run")
+        + _button("Cancel", "cancel-pre-run", aria_label="Cancel pre-run")
         + "</section>"
     )
 
@@ -278,43 +322,230 @@ def render_workspace_html(
         _button(
             "Advanced",
             "toggle-advanced",
-            'id="advanced-toggle" aria-pressed="false" aria-label="Toggle advanced view"',
+            'id="advanced-toggle" aria-pressed="false"',
+            aria_label="Toggle advanced view",
         )
         + '\n        '
     )
     controls = (
         '<nav data-region="run-controls">'
         + advanced_toggle
-        + _button("Start", "start")
-        + _button("Pause", "pause")
-        + _button("Stop", "stop")
+        + _button("Start", "start", aria_label="Start generation")
+        + _button("Pause", "pause", aria_label="Pause generation")
+        + _button("Stop", "stop", aria_label="Stop generation")
         + "</nav>"
     )
     prompt = (
         '<section data-region="prompt">'
         '<label for="prompt-text">Prompt</label>'
-        f'<textarea id="prompt-text">{escape(workspace.raw_user_prompt)}</textarea>'
+        f'<textarea id="prompt-text" aria-label="Prompt">{escape(workspace.raw_user_prompt)}</textarea>'
         "</section>"
     )
     notification = (
-        f'<div data-region="notification">{escape(workspace.notification)}</div>'
+        '<div data-region="notification"'
+        + ' aria-live="assertive"'
+        + ' aria-label="Run notification">'
+        + f"{escape(workspace.notification)}"
+        + "</div>"
     )
     script = """
     <script>
-    document.addEventListener('click', function(event) {
-        var button = event.target.closest('button[data-action="toggle-advanced"]');
-        if (!button) return;
-        var advancedView = document.getElementById('advanced-view');
-        if (!advancedView) return;
-        var pressed = button.getAttribute('aria-pressed') === 'true';
-        button.setAttribute('aria-pressed', String(!pressed));
-        advancedView.hidden = pressed;
-    });
+    (function() {
+        var toggleButton = document.getElementById('advanced-toggle');
+        if (toggleButton) {
+            toggleButton.addEventListener('click', function(event) {
+                var advancedView = document.getElementById('advanced-view');
+                if (!advancedView) return;
+                var pressed = toggleButton.getAttribute('aria-pressed') === 'true';
+                toggleButton.setAttribute('aria-pressed', String(!pressed));
+                advancedView.hidden = pressed;
+            });
+            toggleButton.addEventListener('keydown', function(event) {
+                if (event.key === ' ' || event.key === 'Enter') {
+                    event.preventDefault();
+                    toggleButton.click();
+                }
+            });
+        }
+        var catalogue = document.querySelector('[data-region="catalogue"]');
+        if (catalogue) {
+            var cards = Array.from(catalogue.querySelectorAll('.candidate-card'));
+            catalogue.addEventListener('keydown', function(event) {
+                var card = event.target.closest('.candidate-card');
+                if (!card) return;
+                var index = cards.indexOf(card);
+                if (index < 0) return;
+                if (event.key === 'ArrowDown') {
+                    event.preventDefault();
+                    var next = cards[index + 1];
+                    if (next) next.focus();
+                } else if (event.key === 'ArrowUp') {
+                    event.preventDefault();
+                    var prev = cards[index - 1];
+                    if (prev) prev.focus();
+                } else if (event.key === 'Enter') {
+                    event.preventDefault();
+                    card.dispatchEvent(new MouseEvent('click', {bubbles: true}));
+                } else if (event.key === 'Delete') {
+                    event.preventDefault();
+                    card.dispatchEvent(new MouseEvent('click', {bubbles: true}));
+                }
+            });
+        }
+        var modal = document.querySelector('[data-region="pre-run-modal"]');
+        if (modal) {
+            modal.addEventListener('keydown', function(event) {
+                if (event.key === 'Escape') {
+                    var cancelButton = modal.querySelector('button[data-action="cancel-pre-run"]');
+                    if (cancelButton) {
+                        event.preventDefault();
+                        cancelButton.click();
+                    }
+                }
+            });
+        }
+        var viewport = document.querySelector('.catalogue-viewport');
+        if (viewport) {
+            var scale = 1;
+            var panning = false;
+            var startX = 0;
+            var startY = 0;
+            var scrollLeft = 0;
+            var scrollTop = 0;
+            var MIN_SCALE = 0.5;
+            var MAX_SCALE = 3.0;
+            var applyTransform = function() {
+                viewport.style.transform = 'scale(' + scale + ')';
+            };
+            var clamp = function(value) {
+                return Math.max(MIN_SCALE, Math.min(MAX_SCALE, value));
+            };
+            viewport.addEventListener('wheel', function(event) {
+                if (!event.ctrlKey && !event.metaKey) {
+                    return;
+                }
+                event.preventDefault();
+                var delta = event.deltaY > 0 ? -0.1 : 0.1;
+                scale = clamp(scale + delta);
+                applyTransform();
+            });
+            viewport.addEventListener('mousedown', function(event) {
+                if (scale <= 1.0) {
+                    return;
+                }
+                event.preventDefault();
+                panning = true;
+                startX = event.pageX - viewport.offsetLeft;
+                startY = event.pageY - viewport.offsetTop;
+                scrollLeft = viewport.scrollLeft;
+                scrollTop = viewport.scrollTop;
+            });
+            window.addEventListener('mousemove', function(event) {
+                if (!panning) {
+                    return;
+                }
+                event.preventDefault();
+                var x = event.pageX - viewport.offsetLeft;
+                var y = event.pageY - viewport.offsetTop;
+                viewport.scrollLeft = scrollLeft - (x - startX);
+                viewport.scrollTop = scrollTop - (y - startY);
+            });
+            window.addEventListener('mouseup', function() {
+                panning = false;
+            });
+            viewport.addEventListener('dblclick', function(event) {
+                event.preventDefault();
+                scale = 1;
+                applyTransform();
+            });
+            var zoomInButton = document.querySelector('button[data-action="zoom-in"]');
+            if (zoomInButton) {
+                zoomInButton.addEventListener('click', function() {
+                    scale = clamp(scale + 0.2);
+                    applyTransform();
+                });
+            }
+            var zoomOutButton = document.querySelector('button[data-action="zoom-out"]');
+            if (zoomOutButton) {
+                zoomOutButton.addEventListener('click', function() {
+                    scale = clamp(scale - 0.2);
+                    applyTransform();
+                });
+            }
+            var zoomResetButton = document.querySelector('button[data-action="zoom-reset"]');
+            if (zoomResetButton) {
+                zoomResetButton.addEventListener('click', function() {
+                    scale = 1;
+                    applyTransform();
+                });
+            }
+        }
+    })();
     </script>
     """
+    style = """
+    <style>
+        .catalogue-viewport {
+            overflow: auto;
+            transform-origin: 0 0;
+        }
+        .candidate-catalogue {
+            transform-origin: 0 0;
+            transition: transform 0.1s ease;
+        }
+        .zoom-controls {
+            display: flex;
+            gap: 0.5rem;
+            margin-bottom: 1rem;
+        }
+        @media (max-width: 768px) {
+            [data-region="run-controls"] {
+                flex-direction: column;
+                align-items: stretch;
+            }
+            [data-region="run-controls"] button {
+                width: 100%;
+            }
+            .candidate-catalogue {
+                display: grid;
+                grid-template-columns: 1fr;
+            }
+            body {
+                font-size: 14px;
+            }
+            [data-region="pre-run-modal"] {
+                margin: 0.5rem;
+                width: calc(100% - 1rem);
+            }
+        }
+        @media (max-width: 479px) {
+            main > section,
+            main > .catalogue-viewport {
+                padding: 0.25rem;
+            }
+            [data-region="progress-heartbeat"] > ul > li:not(:first-child) {
+                display: none;
+            }
+            [data-region="notification"] {
+                font-size: 0.8rem;
+            }
+            .zoom-controls {
+                gap: 0.25rem;
+            }
+            [data-region="run-controls"] button,
+            [data-region="pre-run-modal"] button {
+                width: 100%;
+            }
+        }
+    </style>
+    """
     return (
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>Bruteforce Canvas</title></head>"
+        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Bruteforce Canvas</title>"
+        + style
+        + "</head>"
         "<body>"
+        + '<a href="#main-content" class="skip-link">Skip to main content</a>'
+        + "<main id=\"main-content\">"
         + controls
         + prompt
         + _pre_run_modal(pre_run_modal)
@@ -325,6 +556,7 @@ def render_workspace_html(
         + notification
         + _diagnostics(diagnostics)
         + _advanced_view(workspace)
+        + "</main>"
         + script
         + "</body></html>"
     )
