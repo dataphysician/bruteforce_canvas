@@ -5,6 +5,7 @@ from typing import Any, cast
 from pydantic import Field
 
 from bruteforce_canvas.actions import decide_coordinate_actions, decide_image_actions
+from bruteforce_canvas.balancer import BayesianBalancer
 from bruteforce_canvas.evaluation import (
     AlignmentEvaluation,
     DispositionSignal,
@@ -31,7 +32,6 @@ from bruteforce_canvas.learning import (
     LearningState,
     apply_coordinate_learning,
     coordinate_quarantine_decision,
-    enum_suppression_decision,
 )
 from bruteforce_canvas.persistence import PERSISTENCE_VERSION, JsonlEventStore, PersistenceRecord
 from bruteforce_canvas.router import CompatibilityTrace
@@ -314,6 +314,7 @@ class PersistentSeedSweepWorker:
                         evaluation.aggregate,
                         learning_state,
                         item.combo_signature,
+                        item.sampled_arms,
                         item.locked_arms,
                     ),
                     "learning_signal_source": "automated_evaluation",
@@ -433,8 +434,28 @@ class PersistentSeedSweepWorker:
         aggregate,
         learning_state: LearningState,
         combo_signature: str,
-        locked_arms: dict[str, str],
+        sampled_arms: dict[str, str] | None,
+        locked_arms: dict[str, str] | None = None,
     ) -> dict[str, object]:
+        if locked_arms is None:
+            locked_arms = sampled_arms or {}
+            sampled_arms = {
+                arm.axis: arm.value
+                for arm in learning_state.enum_arms.values()
+                if arm.locked_reliability_observations == 0
+            }
+        sampled_arms = sampled_arms or {}
+        event = LearningEvent(
+            event_id=f"eval:{aggregate.coordinate_id}",
+            coordinate_id=aggregate.coordinate_id,
+            sampled_arms=sampled_arms,
+            locked_arms=locked_arms,
+            combo_signature=combo_signature,
+            aggregate=aggregate,
+        )
+        balancer = BayesianBalancer(learning_state, self.enum_suppression_policy)
+        updated_learning_state = balancer.update(event)
+        balancer_snapshot = balancer.snapshot()
         lifecycle_by_outcome = {
             "strong": "strong",
             "viable": "viable",
@@ -443,17 +464,7 @@ class PersistentSeedSweepWorker:
             "blocked": "blocked",
         }
         suppression_records = []
-        for arm in learning_state.enum_arms.values():
-            if arm.locked_reliability_observations > 0:
-                continue
-            decision = enum_suppression_decision(
-                arm,
-                repeated_failure_types=aggregate.aggregate_failure_types,
-                user_authored_locked=False,
-                min_observations=self.enum_suppression_policy.min_observations,
-                pass_rate_floor=self.enum_suppression_policy.pass_rate_floor,
-                stable_failure_family_ratio=self.enum_suppression_policy.stable_failure_family_ratio,
-            )
+        for arm, decision in balancer.suppression_results:
             suppression_records.append(
                 {
                     "field_path": arm.axis,
@@ -466,8 +477,9 @@ class PersistentSeedSweepWorker:
                     "min_exploration_probability": self.enum_suppression_policy.min_exploration_probability,
                 }
             )
-        combo = learning_state.combo_affinities.get(combo_signature, ComboAffinityState(combo_signature=combo_signature))
-        quarantine = coordinate_quarantine_decision(aggregate, combo)
+        quarantine = balancer.quarantine_decision
+        if quarantine is None:
+            raise RuntimeError("balancer update did not produce a quarantine decision")
         quarantine_records = [
             {
                 "coordinate_id": aggregate.coordinate_id,
@@ -479,7 +491,7 @@ class PersistentSeedSweepWorker:
         locked_reliability_records = []
         for axis, value in locked_arms.items():
             key = f"{axis}={value}"
-            arm = learning_state.enum_arms[key]
+            arm = updated_learning_state.enum_arms[key]
             locked_reliability_records.append(
                 {
                     "field_path": axis,
@@ -507,12 +519,12 @@ class PersistentSeedSweepWorker:
                 "reason": aggregate.outcome,
             },
             "suppression_counters": {
-                "checked": len(suppression_records),
-                "suppressed": sum(1 for record in suppression_records if record["suppressed"]),
+                "checked": balancer_snapshot.suppression_checked_count,
+                "suppressed": balancer_snapshot.suppressed_count,
             },
             "quarantine_counters": {
-                "checked": 1,
-                "quarantined": int(quarantine.quarantine),
+                "checked": balancer_snapshot.quarantine_checked_count,
+                "quarantined": balancer_snapshot.quarantined_count,
             },
             "suppression_records": suppression_records,
             "quarantine_records": quarantine_records,
