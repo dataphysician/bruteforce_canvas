@@ -87,4 +87,4 @@ def test_coordinate_action_planner_retires_fragile_and_failed_coordinates():
 def test_coordinate_action_planner_quarantines_repeated_zero_pass_failure():
     actions = decide_coordinate_actions(aggregate("failed", 0), quarantine=True)
 
-    assert [action.name for action in actions] == [ActionName.QUARANTINE_COORDINATE]
+    assert [action.name for action in actions] == [ActionName.RETIRE_COORDINATE, ActionName.QUARANTINE_COORDINATE]

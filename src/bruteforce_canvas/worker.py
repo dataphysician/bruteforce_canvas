@@ -258,7 +258,23 @@ class PersistentSeedSweepWorker:
             )
         )
         self._persist_seed_surf_bundle(item, evaluation.aggregate, first)
-        for action in decide_coordinate_actions(evaluation.aggregate):
+        learning_state = apply_coordinate_learning(
+            LearningState(),
+            LearningEvent(
+                event_id=f"eval:{item.coordinate_id}",
+                coordinate_id=item.coordinate_id,
+                sampled_arms=item.sampled_arms,
+                locked_arms=item.locked_arms,
+                combo_signature=item.combo_signature,
+                aggregate=evaluation.aggregate,
+            ),
+        )
+        combo = learning_state.combo_affinities.get(
+            item.combo_signature,
+            ComboAffinityState(combo_signature=item.combo_signature),
+        )
+        quarantine = coordinate_quarantine_decision(evaluation.aggregate, combo)
+        for action in decide_coordinate_actions(evaluation.aggregate, quarantine=quarantine.quarantine):
             action_name = str(action.name)
             action_key = f"system_action:{action_name}:{item.coordinate_id}"
             self.store.append(
@@ -278,17 +294,6 @@ class PersistentSeedSweepWorker:
                     },
                 )
             )
-        learning_state = apply_coordinate_learning(
-            LearningState(),
-            LearningEvent(
-                event_id=f"eval:{item.coordinate_id}",
-                coordinate_id=item.coordinate_id,
-                sampled_arms=item.sampled_arms,
-                locked_arms=item.locked_arms,
-                combo_signature=item.combo_signature,
-                aggregate=evaluation.aggregate,
-            ),
-        )
         self.store.append(
             PersistenceRecord(
                 record_id=f"learning_delta:{item.coordinate_id}",

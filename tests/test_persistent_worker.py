@@ -275,7 +275,10 @@ def test_persistent_worker_persists_coordinate_retirement_action_for_failed_coor
     ]
     learning = next(record for record in store.replay() if record.record_type == "learning_delta")
     assert result.aggregate.outcome == "failed"
-    assert [record.payload["action_name"] for record in coordinate_actions] == ["retire_coordinate"]
+    assert [record.payload["action_name"] for record in coordinate_actions] == [
+        "retire_coordinate",
+        "quarantine_coordinate",
+    ]
     assert coordinate_actions[0].payload["persistence_version"] == "1"
     assert learning.payload["promotion_curation_state"] == {
         "promoted_count": 0,

@@ -57,8 +57,9 @@ def decide_coordinate_actions(
         "coordinate_id": aggregate.coordinate_id,
         "reasons": aggregate.aggregate_failure_types,
     }
-    if quarantine:
-        return [SystemAction(name=ActionName.QUARANTINE_COORDINATE, **base)]
+    actions: list[SystemAction] = []
     if aggregate.outcome in {"failed", "fragile"}:
-        return [SystemAction(name=ActionName.RETIRE_COORDINATE, **base)]
-    return []
+        actions.append(SystemAction(name=ActionName.RETIRE_COORDINATE, **base))
+    if quarantine:
+        actions.append(SystemAction(name=ActionName.QUARANTINE_COORDINATE, **base))
+    return actions
