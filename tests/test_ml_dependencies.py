@@ -14,3 +14,8 @@ def test_ml_dependencies_importable() -> None:
     import transformers  # noqa: F401
     import safetensors  # noqa: F401
     from PIL import Image  # noqa: F401
+
+
+def test_gpytorch_importable() -> None:
+    pytest.importorskip("gpytorch")
+    import gpytorch  # noqa: F401
