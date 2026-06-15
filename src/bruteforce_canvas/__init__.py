@@ -24,6 +24,7 @@ __all__ = [
     "scheduler",
     "seed_surfing",
     "static_ui",
+    "transport",
     "ui",
     "worker",
 ]

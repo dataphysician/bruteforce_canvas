@@ -95,6 +95,7 @@ class UIStreamEvent(StrictModel):
         "run_stalled",
         "infrastructure_warning",
         "infrastructure_error",
+        "seed_test",
     ]
     run_id: RunId
     coordinate_id: str | None = None

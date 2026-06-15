@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs
 
 from bruteforce_canvas.persistence import JsonlEventStore, PersistenceRecord, reconstruct_run_state
 from bruteforce_canvas.static_ui import render_workspace_html
+from bruteforce_canvas.transport import EventBus
 from bruteforce_canvas.ui import (
     CandidateCard,
     DetailReport,
@@ -16,6 +22,7 @@ from bruteforce_canvas.ui import (
 from bruteforce_canvas.shared import FeedbackAction
 
 DEFAULT_EVENT_TIMESTAMP = "1970-01-01T00:00:00Z"
+DEFAULT_STREAM_PORT = 8765
 
 
 def candidate_cards_from_records(records: list[PersistenceRecord]) -> list[CandidateCard]:
@@ -388,6 +395,10 @@ def main(argv: list[str] | None = None) -> int:
     render.add_argument("--store", required=True)
     render.add_argument("--output", required=True)
     render.add_argument("--diagnostics", action="store_true")
+    stream = subparsers.add_parser("stream")
+    stream.add_argument("--run-id", required=True)
+    stream.add_argument("--seed-test-event", action="store_true")
+    stream.add_argument("--port", type=int, default=DEFAULT_STREAM_PORT)
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
@@ -396,7 +407,94 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "render-workspace":
         render_workspace_from_store(Path(args.store), Path(args.output), include_diagnostics=args.diagnostics)
         return 0
+    if args.command == "stream":
+        return _run_stream_command(args.run_id, seed_test_event=args.seed_test_event, port=args.port)
     return 2
+
+
+def _run_stream_command(run_id: str, *, seed_test_event: bool, port: int) -> int:
+    bus = EventBus()
+    server = _make_stream_server(run_id, bus, port)
+
+    def serve_forever() -> None:
+        try:
+            server.serve_forever(poll_interval=0.1)
+        except Exception:
+            pass
+
+    thread = threading.Thread(target=serve_forever, daemon=True)
+    thread.start()
+
+    if seed_test_event:
+        bus.publish(
+            UIStreamEvent(
+                event_id="seed-1",
+                event_type="seed_test",
+                run_id=run_id,
+                lifecycle_state="running",
+                message="seed test event",
+                timestamp=_utc_iso_timestamp(),
+            )
+        )
+
+    try:
+        while thread.is_alive():
+            thread.join(timeout=0.1)
+    except KeyboardInterrupt:
+        server.shutdown()
+        bus.close()
+        return 0
+    server.shutdown()
+    bus.close()
+    return 0
+
+
+def _utc_iso_timestamp() -> str:
+    from datetime import UTC, datetime
+
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _make_stream_server(run_id: str, bus: EventBus, port: int = 0) -> HTTPServer:
+    bus_ref = bus
+    run_id_ref = run_id
+
+    class _StreamingHTTPServer(HTTPServer):
+        allow_reuse_address = True
+
+    class StreamHandler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:
+            return None
+
+        def do_GET(self) -> None:
+            parsed = parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+            request_run_id = parsed.get("run_id", [""])[0]
+            if not request_run_id or request_run_id != run_id_ref:
+                self.send_error(400, "missing or mismatched run_id")
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            try:
+                self._stream_events(bus_ref)
+            except (ConnectionError, BrokenPipeError, OSError):
+                pass
+
+        def _stream_events(self, bus: EventBus) -> None:
+            async def consume() -> None:
+                async for event in bus.subscribe():
+                    try:
+                        self.wfile.write(f"data: {event.model_dump_json()}\n\n".encode("utf-8"))
+                        self.wfile.flush()
+                    except OSError:
+                        break
+
+            asyncio.run(consume())
+
+    server = _StreamingHTTPServer(("127.0.0.1", port), StreamHandler)
+    return server
 
 
 if __name__ == "__main__":

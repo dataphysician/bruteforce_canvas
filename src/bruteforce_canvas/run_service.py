@@ -3,7 +3,9 @@ from __future__ import annotations
 import time
 from collections import deque
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Any
+from uuid import uuid4
 
 from bruteforce_canvas.evaluation import ImageEvaluationResult
 from bruteforce_canvas.gates import GateError, StageGate
@@ -26,7 +28,8 @@ from bruteforce_canvas.prompt_models import PromptDocumentSpec
 from bruteforce_canvas.router import CandidateCoordinateBatch
 from bruteforce_canvas.shared import FeedbackAction
 from bruteforce_canvas.telemetry import collect_vram_telemetry, measure_vram_gib
-from bruteforce_canvas.ui import UIEvent
+from bruteforce_canvas.ui import UIEvent, UIStreamEvent
+from bruteforce_canvas.transport import EventBus
 from bruteforce_canvas.worker import PersistentSeedSweepWorker, SeedSweepWorkItem
 
 
@@ -37,10 +40,12 @@ class RunService:
         config: RunConfig,
         store: JsonlEventStore,
         worker: PersistentSeedSweepWorker,
+        event_bus: EventBus | None = None,
     ) -> None:
         self.config = config
         self.store = store
         self.worker = worker
+        self.event_bus = event_bus or EventBus()
         self._pending: deque[SeedSweepWorkItem] = deque()
         self._state = RunRuntimeState.RUNNING
         self._stop_requested = False
@@ -177,8 +182,32 @@ class RunService:
             for record in self.store.replay()
         )
 
+    def _publish_event(self, *, event_type: str, message: str, state: RunRuntimeState) -> None:
+        if event_type == "tick_executed":
+            stream_type = "generation_started"
+        elif event_type == "gate_blocked":
+            stream_type = "pre_run_parse_blocked"
+        elif state == RunRuntimeState.PAUSED:
+            stream_type = "run_paused"
+        elif state == RunRuntimeState.STOPPED:
+            stream_type = "run_stopped"
+        elif state == RunRuntimeState.RUNNING:
+            stream_type = "run_started"
+        else:
+            stream_type = "run_started"
+        event = UIStreamEvent(
+            event_id=str(uuid4()),
+            timestamp=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            event_type=stream_type,
+            run_id=self.config.run_id,
+            lifecycle_state=state.value,
+            message=message,
+        )
+        self.event_bus.publish(event)
+
     def tick(self) -> LoopDecision:
         counters = self._counters_from_store()
+        previous_state = self._state
         decision = next_loop_action(
             self.config,
             counters,
@@ -195,14 +224,31 @@ class RunService:
             if gate_decision is not None:
                 self._persist_gate_blocked(gate_decision)
                 self._maybe_sample_vram()
+                if self._state != previous_state or True:
+                    self._publish_event(
+                        event_type="gate_blocked",
+                        message=gate_decision.reason,
+                        state=self._state,
+                    )
                 return gate_decision
             self._state = RunRuntimeState(decision.next_state)
             item = self._pending.popleft()
             self.worker.run_seed_sweep(item)
             self._maybe_sample_vram()
+            self._publish_event(
+                event_type="tick_executed",
+                message="processed pending coordinate",
+                state=self._state,
+            )
             return decision
         self._state = RunRuntimeState(decision.next_state)
         self._maybe_sample_vram()
+        if self._state != previous_state:
+            self._publish_event(
+                event_type="state_changed",
+                message=str(decision.reason),
+                state=self._state,
+            )
         return decision
 
     def _maybe_sample_vram(self) -> None:
