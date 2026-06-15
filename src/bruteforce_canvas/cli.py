@@ -240,15 +240,16 @@ def event_stream_from_records(records: list[PersistenceRecord]) -> list[UIStream
                 )
         elif record.record_type == "feedback":
             action = record.payload.get("feedback_action")
-            if action == "accept":
-                events.append(
-                    _stream_event(
-                        record,
-                        event_type="feedback_accepted",
-                        lifecycle_state="curated",
-                        message="Feedback accepted.",
-                    )
+            events.append(
+                _stream_event(
+                    record,
+                    event_type="feedback_accepted",
+                    lifecycle_state="curated" if action == "accept" else "feedback_recorded",
+                    message="Feedback accepted.",
                 )
+            )
+            if action == "accept":
+                continue
             elif action in {"reject", "shred"}:
                 events.append(
                     _stream_event(

@@ -309,6 +309,7 @@ def test_event_stream_from_records_projects_required_ui_lifecycle_concepts():
         "image_promoted_curated",
         "iqa_evaluation_completed",
         "vlm_evaluation_completed",
+        "feedback_accepted",
         "image_removed_from_visible_catalogue",
         "infrastructure_warning",
         "run_paused",
@@ -324,6 +325,10 @@ def test_event_stream_from_records_projects_required_ui_lifecycle_concepts():
     assert generated.lifecycle_state == "generated"
     assert generated.message == "Image generated."
     assert generated.payload_reference == "candidate_1"
+    feedback = next(event for event in events if event.event_type == "feedback_accepted")
+    assert feedback.candidate_id == "cand_7"
+    assert feedback.lifecycle_state == "feedback_recorded"
+    assert feedback.payload_reference == "feedback_1"
     assert next(event for event in events if event.event_type == "run_paused").event_id == "evt_pause"
 
 
