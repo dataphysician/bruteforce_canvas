@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 from pydantic import Field
 
 from bruteforce_canvas.actions import decide_coordinate_actions, decide_image_actions
 from bruteforce_canvas.evaluation import (
     AlignmentEvaluation,
+    DispositionSignal,
     EvaluationBatchRequest,
     EvaluationImageInput,
     EvaluationPlan,
@@ -24,6 +25,7 @@ from bruteforce_canvas.evaluation import (
 from bruteforce_canvas.generation import GenerationRequest, GenerationResult
 from bruteforce_canvas.learning import (
     ComboAffinityState,
+    DEFAULT_CONTEXT_KEY,
     EnumSuppressionPolicy,
     LearningEvent,
     LearningState,
@@ -64,7 +66,7 @@ class PersistentSeedSweepWorker:
         self,
         *,
         store: JsonlEventStore,
-        generator: object,
+        generator: Any,
         iqa: StaticIQAAdapter,
         vlm: StaticVLMAdapter,
         impact: StaticImpactAdapter | None = None,
@@ -200,7 +202,7 @@ class PersistentSeedSweepWorker:
                     pass_flags={"quality": False, "alignment": False, "full": False},
                     failure_types=[failure_type],
                     localized_blame=[],
-                    disposition_signal=generation_result.disposition_signal,
+                    disposition_signal=cast(DispositionSignal, generation_result.disposition_signal),
                     confidence="low",
                 )
             )
@@ -456,7 +458,7 @@ class PersistentSeedSweepWorker:
                 {
                     "field_path": arm.axis,
                     "enum_value": arm.value,
-                    "context_key": arm.context_key,
+                    "context_key": None if arm.context_key == DEFAULT_CONTEXT_KEY else arm.context_key,
                     "reason": decision.reason,
                     "suppressed": decision.suppress,
                     "suppression_state": decision.state,

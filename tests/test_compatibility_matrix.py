@@ -132,3 +132,8 @@ def test_router_bayesian_score_includes_compatibility_prior_weight():
 
     assert downranked.coordinates[0].compatibility_trace.prior_score < 1.0
     assert downranked.coordinates[0].bayesian_score < neutral.coordinates[0].bayesian_score
+
+
+def test_pair_rules_default_to_pair_family_rules():
+    prior = CompatibilityPrior()
+    assert prior.pair_rules

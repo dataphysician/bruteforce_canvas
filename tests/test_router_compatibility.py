@@ -103,3 +103,31 @@ def test_router_can_allow_suppressed_arm_only_through_exploration_floor():
         "SOFT_WINDOW_LIGHT"
     }
     assert "BLUE_HOUR" in {coord.sampled_arms["cinematography.lighting_mood"] for coord in with_floor.coordinates}
+
+
+def test_router_rejects_pair_family_hard_rejects():
+    prior = CompatibilityPrior()
+    batch = LHSRouter(seed=7, compatibility_prior=prior).propose(
+        RouterInput(
+            run_id="run_001",
+            prompt_document_id="doc_001",
+            target_manifest_id="eval_manifest_001",
+            sampleable_axes={
+                "cinematography.shot_size": [
+                    ThompsonArmState(axis="cinematography.shot_size", value="MACRO", alpha=10, beta=1),
+                    ThompsonArmState(axis="cinematography.shot_size", value="MEDIUM_SHOT", alpha=10, beta=1),
+                ],
+                "cinematography.camera_angle": [
+                    ThompsonArmState(axis="cinematography.camera_angle", value="WIDE_SHOT", alpha=10, beta=1),
+                    ThompsonArmState(axis="cinematography.camera_angle", value="EYE_LEVEL", alpha=10, beta=1),
+                ],
+            },
+            count=1,
+        )
+    )
+
+    assert all(
+        "macro captures only a tiny patch; wide_shot framing is physically impossible"
+        not in coord.compatibility_trace.hard_rejects
+        for coord in batch.coordinates
+    )

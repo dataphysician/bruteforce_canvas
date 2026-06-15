@@ -86,12 +86,40 @@ class CompatibilityTrace(StrictModel):
     mean_pair_score: float = 1.0
     downranks: list[CompatibilityTraceEntry] = Field(default_factory=list)
     boosts: list[CompatibilityTraceEntry] = Field(default_factory=list)
+    pair_family_rejects: list[CompatibilityTraceEntry] = Field(default_factory=list)
 
 
 class CompatibilityPrior(StrictModel):
     hard_rejected_arms: dict[str, set[str]] = Field(default_factory=dict)
     hard_rejected_combos: set[str] = Field(default_factory=set)
-    pair_rules: list[CompatibilityMatrixRule] = Field(default_factory=list)
+    pair_rules: list[CompatibilityMatrixRule] | None = None
+
+    def __init__(
+        self,
+        *,
+        hard_rejected_arms: dict[str, set[str]] | None = None,
+        hard_rejected_combos: set[str] | None = None,
+        pair_rules: list[CompatibilityMatrixRule] | None = None,
+    ) -> None:
+        if pair_rules is None:
+            from bruteforce_canvas.compatibility_pairs import PAIR_FAMILY_RULES
+            pair_rules = [
+                CompatibilityMatrixRule(
+                    left_field="__pair_family__",
+                    left_value=axis1_value,
+                    right_field="__pair_family__",
+                    right_value=axis2_value,
+                    severity=severity,
+                    weight=0.0,
+                    reason=reason,
+                )
+                for axis1_value, axis2_value, severity, reason in PAIR_FAMILY_RULES
+            ]
+        super().__init__(
+            hard_rejected_arms=hard_rejected_arms or {},
+            hard_rejected_combos=hard_rejected_combos or set(),
+            pair_rules=pair_rules,
+        )
 
     def allowed_arms(self, axis: str, arms: list[ThompsonArmState]) -> tuple[list[ThompsonArmState], list[str]]:
         rejected_values = self.hard_rejected_arms.get(axis, set())
@@ -103,11 +131,31 @@ class CompatibilityPrior(StrictModel):
             return f"rejected combo {combo_signature}"
         return None
 
+    def pair_family_hard_rejects(self, coordinate: dict[str, str]) -> list[CompatibilityTraceEntry]:
+        rejects: list[CompatibilityTraceEntry] = []
+        for rule in self.pair_rules:
+            if rule.left_field != "__pair_family__" or rule.right_field != "__pair_family__":
+                continue
+            if not rule.matches(coordinate):
+                continue
+            if rule.severity == CompatibilitySeverity.HARD_REJECT:
+                rejects.append(
+                    CompatibilityTraceEntry(
+                        fields=[rule.left_value, rule.right_value],
+                        values=[rule.left_value, rule.right_value],
+                        severity=rule.severity,
+                        weight=rule.weight,
+                        reason=rule.reason,
+                    )
+                )
+        return rejects
+
     def score_coordinate(self, coordinate: dict[str, str]) -> CompatibilityTrace:
         pair_scores: list[float] = []
         downranks: list[CompatibilityTraceEntry] = []
         boosts: list[CompatibilityTraceEntry] = []
         hard_rejects: list[str] = []
+        pair_family_rejects: list[CompatibilityTraceEntry] = []
         for rule in self.pair_rules:
             if not rule.matches(coordinate):
                 continue
@@ -118,6 +166,10 @@ class CompatibilityPrior(StrictModel):
                 weight=rule.weight,
                 reason=rule.reason,
             )
+            if rule.left_field == "__pair_family__" and rule.right_field == "__pair_family__":
+                if rule.severity == CompatibilitySeverity.HARD_REJECT:
+                    pair_family_rejects.append(entry)
+                continue
             if rule.severity == CompatibilitySeverity.HARD_REJECT:
                 hard_rejects.append(rule.reason)
                 pair_scores.append(0.0)
@@ -131,7 +183,9 @@ class CompatibilityPrior(StrictModel):
                 boosts.append(entry)
                 pair_scores.append(min(1.0, 0.80 + rule.weight))
         if not pair_scores:
-            return CompatibilityTrace()
+            return CompatibilityTrace(
+                pair_family_rejects=pair_family_rejects,
+            )
         min_pair = min(pair_scores)
         mean_pair = sum(pair_scores) / len(pair_scores)
         prior_score = min_pair * 0.50 + mean_pair * 0.30 + 1.0 * 0.20
@@ -143,6 +197,7 @@ class CompatibilityPrior(StrictModel):
             mean_pair_score=mean_pair,
             downranks=downranks,
             boosts=boosts,
+            pair_family_rejects=pair_family_rejects,
         )
 
 
@@ -235,7 +290,7 @@ class LHSRouter:
                 continue
             compatibility_trace = self.compatibility_prior.score_coordinate(coordinate_values)
             compatibility_trace = compatibility_trace.model_copy(update={"warnings": [*compatibility_trace.warnings, *warnings]})
-            if compatibility_trace.hard_rejects:
+            if compatibility_trace.hard_rejects or compatibility_trace.pair_family_rejects:
                 rejected_traces.append(compatibility_trace)
                 continue
             arm_score = sum(scores) / len(scores) if scores else 1.0
