@@ -23,3 +23,7 @@ ml = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+  "slow: opt-in slow integration tests (e.g., real model adapters).",
+  "requires_real_models: tests that require heavy ML dependencies to be installed.",
+]
