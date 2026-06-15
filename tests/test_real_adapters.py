@@ -22,13 +22,14 @@ from bruteforce_canvas import real_adapters
 from bruteforce_canvas.evaluation import AlignmentEvaluation, ImpactEvaluation, QualityEvaluation
 from bruteforce_canvas.prompt import EvaluationTarget, EvaluationTargetManifest
 from bruteforce_canvas.real_adapters import (
-    JOYQUALITY_FALLBACK_MODEL_ID,
     JOYQUALITY_PRIMARY_MODEL_ID,
+    JOYQUALITY_PROCESSOR_MODEL_ID,
     MINICPM_V_MODEL_ID,
     TRIBE_V2_MODEL_ID,
     JoyQualityAdapter,
     MiniCPMVAdapter,
     TRIBEv2Adapter,
+    _load_joyquality_processor,
 )
 
 
@@ -56,7 +57,6 @@ def test_joyquality_module_is_importable() -> None:
     assert real_adapters is not None
     assert hasattr(real_adapters, "JoyQualityAdapter")
     assert hasattr(real_adapters, "JOYQUALITY_PRIMARY_MODEL_ID")
-    assert hasattr(real_adapters, "JOYQUALITY_FALLBACK_MODEL_ID")
     # Public symbols must remain importable from the top-level module.
     assert "JoyQualityAdapter" in real_adapters.__all__
 
@@ -142,6 +142,55 @@ def test_joyquality_static_prewarm_is_noop() -> None:
     assert adapter._processor is None
 
 
+def test_joyquality_real_prewarm_moves_model_to_resolved_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeModel:
+        def __init__(self) -> None:
+            self.to_calls: list[str] = []
+            self.eval_calls = 0
+
+        def to(self, device: str) -> "FakeModel":
+            self.to_calls.append(device)
+            return self
+
+        def eval(self) -> None:
+            self.eval_calls += 1
+
+    model = FakeModel()
+    adapter = JoyQualityAdapter(mode="real", device="cuda")
+
+    monkeypatch.setattr(adapter, "_load_model", lambda: (model, object(), JOYQUALITY_PRIMARY_MODEL_ID, "test"))
+    monkeypatch.setattr(adapter, "_resolve_device", lambda: "cuda")
+
+    adapter.prewarm()
+
+    assert model.to_calls == ["cuda"]
+    assert model.eval_calls == 1
+    assert adapter._resolved_device == "cuda"
+
+
+def test_joyquality_processor_loader_falls_back_to_siglip2_base_processor() -> None:
+    class Loader:
+        def __init__(self, name: str, available_model_id: str | None = None) -> None:
+            self.name = name
+            self.available_model_id = available_model_id
+            self.calls: list[str] = []
+
+        def from_pretrained(self, model_id: str) -> str:
+            self.calls.append(model_id)
+            if model_id != self.available_model_id:
+                raise OSError(f"{model_id} missing processor")
+            return f"{self.name}:{model_id}"
+
+    auto_processor = Loader("processor")
+    auto_image_processor = Loader("image_processor", JOYQUALITY_PROCESSOR_MODEL_ID)
+
+    processor = _load_joyquality_processor(auto_processor, auto_image_processor)
+
+    assert processor == f"image_processor:{JOYQUALITY_PROCESSOR_MODEL_ID}"
+    assert auto_processor.calls == [JOYQUALITY_PRIMARY_MODEL_ID, JOYQUALITY_PROCESSOR_MODEL_ID]
+    assert auto_image_processor.calls == [JOYQUALITY_PRIMARY_MODEL_ID, JOYQUALITY_PROCESSOR_MODEL_ID]
+
+
 # ---------------------------------------------------------------------------
 # 3. Real mode — availability guard
 # ---------------------------------------------------------------------------
@@ -175,10 +224,10 @@ def test_joyquality_real_mode_rejects_invalid_arguments() -> None:
 # 4. Public model-id constants — protects the spec contract
 # ---------------------------------------------------------------------------
 def test_joyquality_model_id_constants_match_spec() -> None:
-    """The primary/fallback model ids match the documented references."""
+    """The primary model id matches the documented reference."""
 
     assert JOYQUALITY_PRIMARY_MODEL_ID == "fancyfeast/joyquality-siglip2-so400m-512-16-05k047vn"
-    assert JOYQUALITY_FALLBACK_MODEL_ID == "drexler/joycet-classifier"
+    assert JOYQUALITY_PROCESSOR_MODEL_ID == "google/siglip2-so400m-patch16-512"
 
 
 # ---------------------------------------------------------------------------

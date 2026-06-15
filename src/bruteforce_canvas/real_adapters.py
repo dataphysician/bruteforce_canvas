@@ -37,12 +37,9 @@ from bruteforce_canvas.prompt import EvaluationTargetManifest
 
 
 # Spec 04 §6.1 / §20: JoyQuality SigLIP2 SO400M is the reference IQA
-# encoder. The model card does not declare a license, so we attempt the
-# open weights as primary but transparently fall back to a small open
-# IQA model that ships with a clear license (Apache-2.0) when the
-# primary is unavailable locally.
+# encoder.
 JOYQUALITY_PRIMARY_MODEL_ID = "fancyfeast/joyquality-siglip2-so400m-512-16-05k047vn"
-JOYQUALITY_FALLBACK_MODEL_ID = "drexler/joycet-classifier"
+JOYQUALITY_PROCESSOR_MODEL_ID = "google/siglip2-so400m-patch16-512"
 
 # Spec 04 / Phase G: MiniCPM-V 4.6 is the reference open-source VLM
 # used for the alignment evaluator. The adapter below wraps it
@@ -87,10 +84,9 @@ class JoyQualityAdapter:
         ``StaticIQAAdapter`` contract.
 
     ``"real"``
-        Lazy-imports ``transformers`` and ``torch`` and loads a SigLIP2
-        classifier (or its open fallback). The first call to
-        :meth:`evaluate` triggers the load if :meth:`prewarm` was not
-        called explicitly.
+        Lazy-imports ``transformers`` and ``torch`` and loads the
+        SigLIP2 classifier. The first call to :meth:`evaluate` triggers
+        the load if :meth:`prewarm` was not called explicitly.
 
     The ``device`` argument controls accelerator placement:
 
@@ -102,11 +98,6 @@ class JoyQualityAdapter:
     ------------
     * **Primary**: ``fancyfeast/joyquality-siglip2-so400m-512-16-05k047vn``
       (the spec 04 §20 reference IQA encoder).
-    * **Fallback**: ``drexler/joycet-classifier`` — a small Apache-2.0
-      IQA classifier used when the primary weights are not present
-      locally and offline mode is enabled. The fallback keeps the
-      public contract identical and is documented here so reviewers
-      can audit the swap.
 
     Notes
     -----
@@ -152,6 +143,11 @@ class JoyQualityAdapter:
             return
         self._model, self._processor, self._resolved_model_id, self._resolved_model_version = self._load_model()
         self._resolved_device = self._resolve_device()
+        try:
+            self._model.to(self._resolved_device)
+        except Exception:
+            pass
+        self._model.eval()
 
     def is_available(self) -> bool:
         """Return ``True`` when the model can actually be loaded.
@@ -255,9 +251,7 @@ class JoyQualityAdapter:
     def _logit_to_score(logits: Any) -> float:
         """Map a raw classifier logit tensor to a ``[0, 1]`` score.
 
-        The exact head varies between the primary SigLIP2 model and the
-        Apache-2.0 fallback (a small linear classifier). We therefore
-        reduce to a scalar via ``sigmoid(mean(logits))`` which works
+        We reduce to a scalar via ``sigmoid(mean(logits))`` which works
         for both single-label and multi-quality-bin heads.
         """
 
@@ -280,31 +274,23 @@ class JoyQualityAdapter:
             return "cpu"
 
     def _load_model(self) -> tuple[Any, Any, str, str]:
-        """Load the SigLIP2 / fallback IQA model and its processor.
+        """Load the JoyQuality SigLIP2 IQA model and its processor.
 
         Returns a 4-tuple ``(model, processor, model_id, model_version)``.
-        The primary model is preferred; if it cannot be reached we
-        transparently fall back to ``JOYQUALITY_FALLBACK_MODEL_ID``.
         """
 
         try:
-            from transformers import AutoModelForImageClassification, AutoProcessor
+            from transformers import AutoImageProcessor, AutoModelForImageClassification, AutoProcessor
         except Exception as error:  # pragma: no cover - exercised only with deps
             raise RuntimeError(
                 "transformers is required for JoyQualityAdapter in 'real' mode; "
                 "install the [ml] extras to enable it"
             ) from error
 
-        try:
-            model = AutoModelForImageClassification.from_pretrained(JOYQUALITY_PRIMARY_MODEL_ID)
-            processor = AutoProcessor.from_pretrained(JOYQUALITY_PRIMARY_MODEL_ID)
-            version = _extract_model_version(model)
-            return model, processor, JOYQUALITY_PRIMARY_MODEL_ID, version
-        except Exception:
-            model = AutoModelForImageClassification.from_pretrained(JOYQUALITY_FALLBACK_MODEL_ID)
-            processor = AutoProcessor.from_pretrained(JOYQUALITY_FALLBACK_MODEL_ID)
-            version = _extract_model_version(model)
-            return model, processor, JOYQUALITY_FALLBACK_MODEL_ID, version
+        model = AutoModelForImageClassification.from_pretrained(JOYQUALITY_PRIMARY_MODEL_ID)
+        processor = _load_joyquality_processor(AutoProcessor, AutoImageProcessor)
+        version = _extract_model_version(model)
+        return model, processor, JOYQUALITY_PRIMARY_MODEL_ID, version
 
 
 def _extract_model_version(model: Any) -> str:
@@ -319,6 +305,24 @@ def _extract_model_version(model: Any) -> str:
     if id_label:
         return str(id_label)
     return _DEFAULT_MODEL_VERSION
+
+
+def _load_joyquality_processor(auto_processor: Any, auto_image_processor: Any) -> Any:
+    """Load the image processor for JoyQuality classifier weights.
+
+    The JoyQuality checkpoint contains the classifier config and
+    weights, but no processor files. The matching SigLIP2 base checkpoint
+    ships the required ``preprocessor_config.json``.
+    """
+
+    last_error: Exception | None = None
+    for loader in (auto_processor, auto_image_processor):
+        for model_id in (JOYQUALITY_PRIMARY_MODEL_ID, JOYQUALITY_PROCESSOR_MODEL_ID):
+            try:
+                return loader.from_pretrained(model_id)
+            except Exception as error:  # pragma: no cover - depends on HF cache/network
+                last_error = error
+    raise RuntimeError("could not load JoyQuality image processor") from last_error
 
 
 def _static_alignment_score(
@@ -849,7 +853,7 @@ class TRIBEv2Adapter:
 __all__ = [
     "JoyQualityAdapter",
     "JOYQUALITY_PRIMARY_MODEL_ID",
-    "JOYQUALITY_FALLBACK_MODEL_ID",
+    "JOYQUALITY_PROCESSOR_MODEL_ID",
     "MiniCPMVAdapter",
     "MINICPM_V_MODEL_ID",
     "TRIBEv2Adapter",
