@@ -6,7 +6,7 @@ from typing import Any, Literal
 
 from pydantic import Field, model_validator
 
-from bruteforce_canvas.generation import DEFAULT_SEED_BUNDLE, MIN_SEED_BUNDLE_SIZE
+from bruteforce_canvas.generation import MIN_SEED_BUNDLE_SIZE
 from bruteforce_canvas.prompt import EvaluationTargetManifest
 from bruteforce_canvas.shared import CandidateId, CoordinateId, DocId, RunId, StrictModel, TargetManifestId
 
@@ -89,8 +89,10 @@ class EvaluationBatchRequest(StrictModel):
     def validate_seed_sweep_shape(self) -> "EvaluationBatchRequest":
         if self.batch_kind == "seed_sweep":
             seeds = [image.seed for image in self.images]
-            if seeds != DEFAULT_SEED_BUNDLE:
-                raise ValueError("seed_sweep requests must use the fixed five-seed bundle")
+            if len(seeds) < MIN_SEED_BUNDLE_SIZE:
+                raise ValueError(
+                    f"seed_sweep requests require at least {MIN_SEED_BUNDLE_SIZE} images"
+                )
         return self
 
 
