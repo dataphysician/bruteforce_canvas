@@ -25,7 +25,7 @@ from bruteforce_canvas.prompt import PromptDocument, RenderedPrompt
 from bruteforce_canvas.prompt_models import PromptDocumentSpec
 from bruteforce_canvas.router import CandidateCoordinateBatch
 from bruteforce_canvas.shared import FeedbackAction
-from bruteforce_canvas.telemetry import measure_vram_gib
+from bruteforce_canvas.telemetry import collect_vram_telemetry, measure_vram_gib
 from bruteforce_canvas.ui import UIEvent
 from bruteforce_canvas.worker import PersistentSeedSweepWorker, SeedSweepWorkItem
 
@@ -46,6 +46,8 @@ class RunService:
         self._stop_requested = False
         self._transition_counter = 0
         self._gate_state = RuntimeGateState()
+        self._vram_sample_counter = 0
+        self._vram_telemetry: list[VRAMTelemetry] = []
 
     @property
     def pending_count(self) -> int:
@@ -62,6 +64,7 @@ class RunService:
             pending_count=len(self._pending),
             vram_gib=measure_vram_gib(),
             snapshot_at=time.time(),
+            vram_telemetry=list(self._vram_telemetry),
         )
 
     def enqueue(self, item: SeedSweepWorkItem) -> None:
@@ -191,13 +194,26 @@ class RunService:
             gate_decision = self._run_gate_chain()
             if gate_decision is not None:
                 self._persist_gate_blocked(gate_decision)
+                self._maybe_sample_vram()
                 return gate_decision
-            self._state = decision.next_state
+            self._state = RunRuntimeState(decision.next_state)
             item = self._pending.popleft()
             self.worker.run_seed_sweep(item)
+            self._maybe_sample_vram()
             return decision
-        self._state = decision.next_state
+        self._state = RunRuntimeState(decision.next_state)
+        self._maybe_sample_vram()
         return decision
+
+    def _maybe_sample_vram(self) -> None:
+        interval = max(1, self.config.vram_sample_interval_ticks)
+        self._vram_sample_counter += 1
+        if self._vram_sample_counter >= interval:
+            self._vram_sample_counter = 0
+            telemetry = collect_vram_telemetry()
+            self._vram_telemetry.append(telemetry)
+            if len(self._vram_telemetry) > 100:
+                self._vram_telemetry = self._vram_telemetry[-100:]
 
     def _run_gate_chain(self) -> LoopDecision | None:
         gate_specs: list[tuple[str, Callable[[], Any]]] = [

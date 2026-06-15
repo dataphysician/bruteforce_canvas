@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 from enum import StrEnum
+from typing import TYPE_CHECKING
 
 from bruteforce_canvas.orchestration import (
     RunConfig,
@@ -10,6 +12,9 @@ from bruteforce_canvas.orchestration import (
     watermark_decision,
 )
 from bruteforce_canvas.shared import StrictModel
+
+if TYPE_CHECKING:
+    from bruteforce_canvas.run_service import RunService
 
 
 class LoopAction(StrEnum):
@@ -72,3 +77,79 @@ def next_loop_action(
         reason="coordinate_budget_available",
         next_state=RunRuntimeState.RUNNING,
     )
+
+
+class AsyncRunDriver:
+    """Asynchronous loop driver that ticks a :class:`RunService` on an interval.
+
+    The driver is bound to the app lifecycle: it holds no persistence, owns a
+    single :class:`asyncio.Task`, and exits cleanly on ``stop()``, on a
+    ``STOPPED`` decision from the service, on an unhandled exception, or on
+    task cancellation.
+    """
+
+    def __init__(self, *, service: RunService, tick_interval: float = 1.0) -> None:
+        self._service = service
+        self._tick_interval = tick_interval
+        self._paused = False
+        self._stop_requested = False
+        self._task: asyncio.Task[None] | None = None
+        self._running = False
+
+    @property
+    def paused(self) -> bool:
+        return self._paused
+
+    @property
+    def running(self) -> bool:
+        return self._running and self._task is not None and not self._task.done()
+
+    @property
+    def stopped(self) -> bool:
+        return self._stop_requested or self._task is None or self._task.done()
+
+    async def start(self) -> None:
+        if self._task is not None and not self._task.done():
+            return
+        self._stop_requested = False
+        self._paused = False
+        self._running = True
+        self._task = asyncio.create_task(self._run(), name="AsyncRunDriver")
+
+    def pause(self) -> None:
+        self._paused = True
+
+    def resume(self) -> None:
+        self._paused = False
+
+    def stop(self) -> None:
+        self._stop_requested = True
+
+    async def join(self) -> None:
+        task = self._task
+        if task is None:
+            return
+        if task.done():
+            return
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    async def _run(self) -> None:
+        try:
+            while not self._stop_requested:
+                await asyncio.sleep(self._tick_interval)
+                if self._stop_requested:
+                    break
+                if self._paused:
+                    continue
+                decision = self._service.tick()
+                if decision.next_state == RunRuntimeState.STOPPED:
+                    break
+        except asyncio.CancelledError:
+            self._stop_requested = True
+        except Exception:
+            self._stop_requested = True
+        finally:
+            self._running = False

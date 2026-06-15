@@ -9,6 +9,7 @@ from pydantic import Field
 from bruteforce_canvas.evaluation import ImageEvaluationResult
 from bruteforce_canvas.generation import DEFAULT_SEED_BUNDLE
 from bruteforce_canvas.shared import CandidateId, CoordinateId, DocId, FeedbackAction, RunId, StrictModel, TargetManifestId
+from bruteforce_canvas.telemetry import VRAMTelemetry
 
 
 class RunConfig(StrictModel):
@@ -25,6 +26,7 @@ class RunConfig(StrictModel):
     promoted_low_watermark: int | None = None
     metacognitive_impact_enabled: bool = False
     metacognitive_min_vram_gib: int = 24
+    vram_sample_interval_ticks: int = 10
 
 
 class RunRuntimeState(StrEnum):
@@ -57,6 +59,7 @@ class RuntimeSnapshot(StrictModel):
     pending_count: int
     vram_gib: float
     snapshot_at: float
+    vram_telemetry: list[VRAMTelemetry] = Field(default_factory=list)
 
 
 class RuntimeDecision(StrictModel):

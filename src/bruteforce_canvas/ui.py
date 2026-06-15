@@ -11,6 +11,7 @@ from bruteforce_canvas.locking import build_default_lock_config
 from bruteforce_canvas.prompt import PromptDocument
 from bruteforce_canvas.prompt_models import PromptDocumentSpec
 from bruteforce_canvas.shared import CandidateId, FeedbackAction, RunId, StrictModel
+from bruteforce_canvas.telemetry import VRAMTelemetry
 
 
 class RunControl(StrEnum):
@@ -194,10 +195,11 @@ class RunWorkspaceReadModel(StrictModel):
     stall_guard_state: str
     notification: str
     elapsed_seconds: int = 0
+    vram_telemetry: list[VRAMTelemetry] = Field(default_factory=list)
 
     @computed_field
     @property
-    def progress_heartbeat(self) -> dict[str, int | str]:
+    def progress_heartbeat(self) -> dict[str, object]:
         return {
             "run_state": self.run_state,
             "generated_count": self.generated_count,
@@ -209,6 +211,7 @@ class RunWorkspaceReadModel(StrictModel):
             "shredded_count": self.shredded_count,
             "stall_guard_state": self.stall_guard_state,
             "elapsed_seconds": self.elapsed_seconds,
+            "vram_telemetry": [item.model_dump() for item in self.vram_telemetry],
         }
 
 
