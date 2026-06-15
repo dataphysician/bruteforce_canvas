@@ -142,6 +142,7 @@ class JoyQualityAdapter:
         if self._model is not None:
             return
         self._model, self._processor, self._resolved_model_id, self._resolved_model_version = self._load_model()
+        assert self._model is not None
         self._resolved_device = self._resolve_device()
         try:
             self._model.to(self._resolved_device)
