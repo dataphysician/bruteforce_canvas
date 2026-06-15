@@ -1,3 +1,5 @@
+from typing import Literal
+
 from bruteforce_canvas.evaluation import (
     CoordinateEvaluationAggregate,
     LearningUpdateSignal,
@@ -14,7 +16,12 @@ from bruteforce_canvas.learning import (
 )
 
 
-def aggregate(*, outcome: str, promoted_count: int, pass_rate: float) -> CoordinateEvaluationAggregate:
+def aggregate(
+    *,
+    outcome: Literal["strong", "viable", "fragile", "failed", "blocked"],
+    promoted_count: int,
+    pass_rate: float,
+) -> CoordinateEvaluationAggregate:
     return CoordinateEvaluationAggregate(
         run_id="run_001",
         prompt_document_id="doc_001",
@@ -65,6 +72,44 @@ def test_coordinate_learning_updates_sampled_arms_and_combo_once():
     assert locked.locked_reliability_observations == 1
     assert combo.observations == 1
     assert second == first
+
+
+def test_coordinate_learning_sends_raw_training_history_to_gp(monkeypatch):
+    calls = []
+
+    def fake_gp_posterior_update(X_train, y_train, X_test):
+        calls.append((X_train, y_train, X_test))
+        return sum(y_train), 0.25 / len(y_train)
+
+    monkeypatch.setattr("bruteforce_canvas.learning.gp_posterior_update", fake_gp_posterior_update)
+    first_event = LearningEvent(
+        event_id="eval:coord_001",
+        coordinate_id="coord_001",
+        sampled_arms={},
+        combo_signature="lighting=BLUE_HOUR|material=CERAMIC",
+        aggregate=aggregate(outcome="failed", promoted_count=0, pass_rate=0.0),
+    )
+    second_event = first_event.model_copy(
+        update={
+            "event_id": "eval:coord_002",
+            "aggregate": aggregate(outcome="strong", promoted_count=5, pass_rate=1.0),
+        }
+    )
+
+    first = apply_coordinate_learning(LearningState(), first_event)
+    second = apply_coordinate_learning(first, second_event)
+
+    combo = second.combo_affinities["lighting=BLUE_HOUR|material=CERAMIC"]
+    assert len(calls) == 2
+    assert len(calls[0][0]) == 1
+    assert calls[0][1] == [-0.5]
+    assert len(calls[1][0]) == 2
+    assert calls[1][1] == [-0.5, 0.5]
+    assert calls[1][2] == [calls[1][0][-1]]
+    assert combo.train_y == [-0.5, 0.5]
+    assert combo.observations == 2
+    assert combo.gp_mean == 0.0
+    assert combo.gp_uncertainty == 0.125
 
 
 def test_enum_suppression_policy_exposes_configurable_cooldown_and_exploration_floor():

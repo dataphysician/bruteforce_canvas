@@ -5,6 +5,7 @@ from typing import Any, Literal
 from pydantic import Field, computed_field, model_validator
 
 from bruteforce_canvas.evaluation import CoordinateEvaluationAggregate
+from bruteforce_canvas.gp import encode_combo_signature, gp_posterior_update
 from bruteforce_canvas.shared import CanonicalStatus, CoordinateId, StrictModel
 
 
@@ -49,6 +50,8 @@ class ComboAffinityState(StrictModel):
     gp_mean: float = 0.0
     gp_uncertainty: float = 1.0
     observations: int = 0
+    train_x: list[list[float]] = Field(default_factory=list)
+    train_y: list[float] = Field(default_factory=list)
     last_failure_type: str | None = None
 
 
@@ -217,12 +220,17 @@ def apply_coordinate_learning(
         ComboAffinityState(combo_signature=event.combo_signature),
     )
     observations = combo.observations + 1
-    gp_mean = combo.gp_mean + (event.aggregate.update_signal.gp_affinity_delta - combo.gp_mean) / observations
+    test_x = encode_combo_signature(event.combo_signature)
+    train_x = [*combo.train_x, test_x]
+    train_y = [*combo.train_y, float(event.aggregate.update_signal.gp_affinity_delta)]
+    gp_mean, gp_uncertainty = gp_posterior_update(train_x, train_y, [test_x])
     combo_affinities[event.combo_signature] = combo.model_copy(
         update={
             "gp_mean": gp_mean,
-            "gp_uncertainty": max(0.05, 1.0 / observations),
+            "gp_uncertainty": gp_uncertainty,
             "observations": observations,
+            "train_x": train_x,
+            "train_y": train_y,
             "last_failure_type": event.aggregate.aggregate_failure_types[0]
             if event.aggregate.aggregate_failure_types
             else combo.last_failure_type,
