@@ -234,8 +234,12 @@ def test_run_service_persists_feedback_for_promoted_curated_candidate(tmp_path: 
     assert result.effective_status == "accepted"
     assert feedback[0].candidate_id == "cand_7"
     assert feedback[0].payload["feedback_action"] == "accept"
+    assert feedback[0].payload["feedback_scope"] == "pre_curated_candidate"
+    assert feedback[0].payload["signal_source"] == "swipe_feedback"
+    assert feedback[0].payload["automated_status"] == "promoted_curated"
     assert feedback[0].payload["persistence_version"] == "1"
     assert feedback_learning[0].payload["learning_delta"]["alpha"] == 1.0
+    assert feedback_learning[0].payload["learning_signal_source"] == "swipe_feedback"
     assert feedback_learning[0].payload["persistence_version"] == "1"
     assert reconstruct_run_state(records).accepted_count == 1
 

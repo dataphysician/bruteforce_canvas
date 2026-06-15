@@ -241,6 +241,7 @@ def test_persistent_worker_persists_each_candidate_before_evaluation(tmp_path: P
     assert any(record.record_type == "evaluation_aggregate" for record in records)
     learning = next(record for record in records if record.record_type == "learning_delta")
     assert learning.payload["persistence_version"] == "1"
+    assert learning.payload["learning_signal_source"] == "automated_evaluation"
     assert learning.payload["locked_reliability_records"] == [
         {
             "field_path": "object.material.object_01",

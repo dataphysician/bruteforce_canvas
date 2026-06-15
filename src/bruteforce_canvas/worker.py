@@ -306,6 +306,7 @@ class PersistentSeedSweepWorker:
                         item.combo_signature,
                         item.locked_arms,
                     ),
+                    "learning_signal_source": "automated_evaluation",
                     "persistence_version": PERSISTENCE_VERSION,
                 },
             )

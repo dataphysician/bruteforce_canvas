@@ -115,6 +115,9 @@ class RunService:
                 idempotency_key=key,
                 payload={
                     "feedback_action": action.value,
+                    "feedback_scope": "pre_curated_candidate",
+                    "signal_source": result.signal_source,
+                    "automated_status": result.automated_status,
                     "effective_status": result.effective_status,
                     "learning_delta": result.learning_delta,
                     "include_in_iqa_negative_dataset": result.include_in_iqa_negative_dataset,
@@ -137,6 +140,7 @@ class RunService:
                     "feedback_action": action.value,
                     "learning_delta": result.learning_delta,
                     "source": result.signal_source,
+                    "learning_signal_source": result.signal_source,
                     "persistence_version": PERSISTENCE_VERSION,
                 },
             )
