@@ -36,6 +36,18 @@ class ComboAffinityState(StrictModel):
     last_failure_type: str | None = None
 
 
+class EnumSuppressionPolicy(StrictModel):
+    min_observations: int = 10
+    pass_rate_floor: float = 0.20
+    stable_failure_family_ratio: float = 0.60
+    cooldown_generated_candidates: int = 500
+    min_exploration_probability: float = 0.01
+
+    @property
+    def cooldown_label(self) -> str:
+        return f"cooldown:{self.cooldown_generated_candidates}_generated_candidates"
+
+
 class LearningState(StrictModel):
     enum_arms: dict[str, EnumArmState] = Field(default_factory=dict)
     combo_affinities: dict[str, ComboAffinityState] = Field(default_factory=dict)

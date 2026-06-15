@@ -24,6 +24,7 @@ from bruteforce_canvas.evaluation import (
 from bruteforce_canvas.generation import GenerationRequest, GenerationResult
 from bruteforce_canvas.learning import (
     ComboAffinityState,
+    EnumSuppressionPolicy,
     LearningEvent,
     LearningState,
     apply_coordinate_learning,
@@ -68,6 +69,7 @@ class PersistentSeedSweepWorker:
         vlm: StaticVLMAdapter,
         impact: StaticImpactAdapter | None = None,
         seed_surf_policy: SeedSurfPolicy | None = None,
+        enum_suppression_policy: EnumSuppressionPolicy | None = None,
     ) -> None:
         self.store = store
         self.generator = generator
@@ -75,6 +77,7 @@ class PersistentSeedSweepWorker:
         self.vlm = vlm
         self.impact = impact
         self.seed_surf_policy = seed_surf_policy
+        self.enum_suppression_policy = enum_suppression_policy or EnumSuppressionPolicy()
 
     def run_seed_sweep(self, item: SeedSweepWorkItem) -> StagedEvaluationResult:
         first = item.generation_requests[0]
@@ -445,6 +448,9 @@ class PersistentSeedSweepWorker:
                 arm,
                 repeated_failure_types=aggregate.aggregate_failure_types,
                 user_authored_locked=False,
+                min_observations=self.enum_suppression_policy.min_observations,
+                pass_rate_floor=self.enum_suppression_policy.pass_rate_floor,
+                stable_failure_family_ratio=self.enum_suppression_policy.stable_failure_family_ratio,
             )
             suppression_records.append(
                 {
@@ -454,8 +460,8 @@ class PersistentSeedSweepWorker:
                     "reason": decision.reason,
                     "suppressed": decision.suppress,
                     "suppression_state": decision.state,
-                    "suppressed_until": "cooldown:500_generated_candidates" if decision.suppress else None,
-                    "min_exploration_probability": 0.01,
+                    "suppressed_until": self.enum_suppression_policy.cooldown_label if decision.suppress else None,
+                    "min_exploration_probability": self.enum_suppression_policy.min_exploration_probability,
                 }
             )
         combo = learning_state.combo_affinities.get(combo_signature, ComboAffinityState(combo_signature=combo_signature))

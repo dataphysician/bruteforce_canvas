@@ -1,6 +1,13 @@
 from pathlib import Path
 
-from bruteforce_canvas.evaluation import DispositionSignal, EvaluationPlan, StaticIQAAdapter, StaticVLMAdapter
+from bruteforce_canvas.evaluation import (
+    CoordinateEvaluationAggregate,
+    DispositionSignal,
+    EvaluationPlan,
+    LearningUpdateSignal,
+    StaticIQAAdapter,
+    StaticVLMAdapter,
+)
 from bruteforce_canvas.generation import (
     CandidateRecord,
     GenerationRequest,
@@ -10,6 +17,7 @@ from bruteforce_canvas.generation import (
     generation_timestamp,
     seed_sweep_requests,
 )
+from bruteforce_canvas.learning import EnumArmState, EnumSuppressionPolicy, LearningState
 from bruteforce_canvas.persistence import JsonlEventStore, reconstruct_run_state
 from bruteforce_canvas.router import CompatibilityTrace, CompatibilityTraceEntry
 from bruteforce_canvas.seed_surfing import SeedSurfPolicy
@@ -314,6 +322,61 @@ def test_persistent_worker_persists_coordinate_retirement_action_for_failed_coor
             "quarantined": True,
         }
     ]
+
+
+def test_persistent_worker_uses_configured_enum_suppression_policy_in_learning_records(tmp_path: Path):
+    worker = PersistentSeedSweepWorker(
+        store=JsonlEventStore(tmp_path / "events.jsonl"),
+        generator=StubGeneratorAdapter(),
+        iqa=StaticIQAAdapter(scores=[]),
+        vlm=StaticVLMAdapter(scores=[]),
+        enum_suppression_policy=EnumSuppressionPolicy(
+            cooldown_generated_candidates=250,
+            min_exploration_probability=0.05,
+        ),
+    )
+    aggregate = CoordinateEvaluationAggregate(
+        run_id="run_001",
+        prompt_document_id="doc_001",
+        target_manifest_id="eval_manifest_001",
+        coordinate_id="coord_001",
+        seeds=[7, 42, 156, 8888, 42069],
+        generated_count=5,
+        evaluated_count=5,
+        promoted_count=0,
+        quality_pass_count=0,
+        alignment_pass_count=0,
+        full_pass_count=0,
+        mean_quality=0.2,
+        mean_alignment=0.2,
+        best_quality=0.3,
+        best_alignment=0.3,
+        pass_rate=0.0,
+        outcome="failed",
+        aggregate_failure_types=["wrong_shot_size"] * 10,
+        aggregate_blame=[],
+        update_signal=LearningUpdateSignal(
+            thompson_alpha_delta=0.0,
+            thompson_beta_delta=5.0,
+            gp_affinity_delta=-0.5,
+        ),
+    )
+    learning_state = LearningState(
+        enum_arms={
+            "cinematography.shot_size=MEDIUM_SHOT": EnumArmState(
+                axis="cinematography.shot_size",
+                value="MEDIUM_SHOT",
+                alpha=1.0,
+                beta=11.0,
+            )
+        }
+    )
+
+    summary = worker._learning_summary(aggregate, learning_state, "shot=MEDIUM_SHOT", {})
+
+    assert summary["suppression_records"][0]["suppressed"] is True
+    assert summary["suppression_records"][0]["suppressed_until"] == "cooldown:250_generated_candidates"
+    assert summary["suppression_records"][0]["min_exploration_probability"] == 0.05
 
 
 def test_persistent_worker_records_seed_surf_bundle_for_strong_coordinate_when_enabled(tmp_path: Path):

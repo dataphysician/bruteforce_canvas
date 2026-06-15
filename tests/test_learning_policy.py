@@ -5,6 +5,7 @@ from bruteforce_canvas.evaluation import (
 from bruteforce_canvas.learning import (
     ComboAffinityState,
     EnumArmState,
+    EnumSuppressionPolicy,
     LearningEvent,
     LearningState,
     apply_coordinate_learning,
@@ -64,6 +65,13 @@ def test_coordinate_learning_updates_sampled_arms_and_combo_once():
     assert locked.locked_reliability_observations == 1
     assert combo.observations == 1
     assert second == first
+
+
+def test_enum_suppression_policy_exposes_configurable_cooldown_and_exploration_floor():
+    policy = EnumSuppressionPolicy(cooldown_generated_candidates=250, min_exploration_probability=0.05)
+
+    assert policy.cooldown_label == "cooldown:250_generated_candidates"
+    assert policy.min_exploration_probability == 0.05
 
 
 def test_learning_update_alone_does_not_suppress_without_policy_thresholds():
