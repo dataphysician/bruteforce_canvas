@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Literal
 
 from pydantic import Field, model_validator
@@ -68,7 +70,7 @@ class EvaluationPlan(StrictModel):
     alignment_cutoff: float
     human_quality_cutoff: float | None = None
     impact_cutoff: float | None = None
-    execution_preference: Literal["auto", "serialized", "parallel"] = "auto"
+    execution_preference: Literal["serialized", "parallel", "tensor_batch", "auto"] = "auto"
 
 
 class EvaluationBatchRequest(StrictModel):
@@ -276,6 +278,581 @@ class StaticImpactAdapter:
         ]
 
 
+class BatchEvaluator:
+    """Execute evaluator stages using serialized, parallel, or tensor-batch dispatch.
+
+    The class accepts both the lightweight test adapters from this module
+    (``score(...)`` methods) and the real Phase G adapters from
+    :mod:`bruteforce_canvas.real_adapters` (``evaluate(...)`` methods). Heavy
+    ML dependencies remain optional because tensor-batch support is discovered
+    by adapter capability rather than imported here.
+    """
+
+    def __init__(
+        self,
+        iqa: Any | None = None,
+        vlm: Any | None = None,
+        impact: Any | None = None,
+        *,
+        request_id: str | None = None,
+    ) -> None:
+        self.iqa = iqa
+        self.vlm = vlm
+        self.impact = impact
+        self.request_id = request_id
+        self.last_metrics: dict[str, float | int] = {}
+        self.last_survivor_candidate_ids: list[str] = []
+
+    def evaluate(
+        self,
+        images: list[EvaluationImageInput],
+        prompt: str,
+        manifest: Any,
+        plan: EvaluationPlan,
+    ) -> list[ImageEvaluationResult]:
+        started = time.perf_counter()
+        self.last_survivor_candidate_ids = []
+        batch_metrics: dict[str, float | int] = {
+            "eval_batch_duration_seconds": 0.0,
+            "eval_batch_size": len(images),
+        }
+
+        try:
+            results = self._evaluate(images, prompt, manifest, plan, batch_metrics)
+        finally:
+            batch_metrics["eval_batch_duration_seconds"] = time.perf_counter() - started
+            self.last_metrics = batch_metrics
+
+        return [self._attach_batch_metrics(result, batch_metrics) for result in results]
+
+    def _evaluate(
+        self,
+        images: list[EvaluationImageInput],
+        prompt: str,
+        manifest: Any,
+        plan: EvaluationPlan,
+        batch_metrics: dict[str, float | int],
+    ) -> list[ImageEvaluationResult]:
+        if not images:
+            return []
+        iqa_mode = self._stage_mode(plan.execution_preference, default="tensor_batch")
+        iqa_telemetry = {"execution_mode": iqa_mode, "elapsed_ms": 0}
+        try:
+            quality_results = self._score_iqa(images, prompt, manifest, iqa_mode)
+        except Exception as error:
+            iqa_telemetry = _failed_stage_telemetry(iqa_mode, error)
+            return [self._unavailable_result(image, plan, {"iqa": iqa_telemetry}) for image in images]
+
+        if len(quality_results) != len(images):
+            error = ValueError("IQA result count must match image count")
+            iqa_telemetry = _failed_stage_telemetry(iqa_mode, error)
+            return [self._unavailable_result(image, plan, {"iqa": iqa_telemetry}) for image in images]
+
+        survivor_pairs: list[tuple[int, EvaluationImageInput, QualityEvaluation]] = [
+            (index, image, quality)
+            for index, (image, quality) in enumerate(zip(images, quality_results, strict=True))
+            if quality.score >= plan.quality_cutoff
+        ]
+        survivor_images = [image for _index, image, _quality in survivor_pairs]
+        self.last_survivor_candidate_ids = [str(image.candidate_id) for image in survivor_images if image.candidate_id is not None]
+
+        vlm_mode = "serialized" if plan.execution_preference == "serialized" else "parallel"
+        vlm_telemetry = {"execution_mode": vlm_mode, "elapsed_ms": 0}
+        try:
+            alignment_results = self._score_vlm(survivor_images, prompt, manifest, vlm_mode)
+        except Exception as error:
+            vlm_telemetry = _failed_stage_telemetry(vlm_mode, error)
+            return self._partial_vlm_failure_results(images, quality_results, plan, iqa_telemetry, vlm_telemetry)
+
+        if len(alignment_results) != len(survivor_images):
+            error = ValueError("VLM result count must match survivor image count")
+            vlm_telemetry = _failed_stage_telemetry(vlm_mode, error)
+            return self._partial_vlm_failure_results(images, quality_results, plan, iqa_telemetry, vlm_telemetry)
+
+        alignment_by_index = {
+            index: alignment
+            for (index, _image, _quality), alignment in zip(survivor_pairs, alignment_results, strict=True)
+        }
+        impact_pairs = [
+            (index, image)
+            for index, image, _quality in survivor_pairs
+            if alignment_by_index[index].score >= plan.alignment_cutoff
+        ]
+        impact_images = [image for _index, image in impact_pairs]
+        impact_mode = "serialized"
+        impact_telemetry = {"execution_mode": impact_mode, "elapsed_ms": 0}
+        impact_enabled = plan.metacognitive_impact and self.impact is not None
+        impact_failed = False
+        if impact_enabled:
+            try:
+                impact_payloads = self._score_impact(impact_images, prompt, manifest, impact_mode)
+            except Exception as error:
+                impact_failed = True
+                impact_telemetry = _failed_stage_telemetry(impact_mode, error)
+                impact_payloads = [None for _image in impact_images]
+            if len(impact_payloads) != len(impact_images):
+                impact_payloads = [None for _image in impact_images]
+        else:
+            impact_payloads = [None for _image in impact_images]
+        impact_by_index = {
+            index: payload
+            for (index, _image), payload in zip(impact_pairs, impact_payloads, strict=True)
+        }
+
+        results: list[ImageEvaluationResult] = []
+        for index, (image, quality) in enumerate(zip(images, quality_results, strict=True)):
+            if index not in alignment_by_index:
+                results.append(self._quality_failure_result(image, quality, plan, iqa_telemetry))
+                continue
+            alignment = alignment_by_index[index]
+            impact_payload = impact_by_index.get(index)
+            results.append(
+                self._full_result(
+                    image,
+                    quality,
+                    alignment,
+                    impact_payload,
+                    plan,
+                    iqa_telemetry,
+                    vlm_telemetry,
+                    impact_telemetry,
+                    impact_enabled,
+                    impact_failed,
+                )
+            )
+        return results
+
+    @staticmethod
+    def _stage_mode(
+        preference: Literal["serialized", "parallel", "tensor_batch", "auto"],
+        *,
+        default: Literal["serialized", "parallel", "tensor_batch"],
+    ) -> Literal["serialized", "parallel", "tensor_batch"]:
+        if preference == "auto":
+            return default
+        return preference
+
+    def _score_iqa(
+        self,
+        images: list[EvaluationImageInput],
+        prompt: str,
+        manifest: Any,
+        mode: str,
+    ) -> list[QualityEvaluation]:
+        if self.iqa is None:
+            raise RuntimeError("iqa evaluator unavailable")
+        if mode == "serialized":
+            if self._supports_path_single_call(self.iqa):
+                return [self._score_iqa_single(image, prompt, manifest) for image in images]
+            return self._score_iqa_batch(images, prompt, manifest)
+        if mode == "parallel":
+            if self._has_single_method(self.iqa):
+                with ThreadPoolExecutor(max_workers=max(1, min(32, len(images)))) as executor:
+                    return list(executor.map(lambda image: self._score_iqa_single(image, prompt, manifest), images))
+            return self._score_iqa_batch(images, prompt, manifest)
+        return self._score_iqa_tensor_batch(images, prompt, manifest)
+
+    def _score_vlm(
+        self,
+        images: list[EvaluationImageInput],
+        prompt: str,
+        manifest: Any,
+        mode: str,
+    ) -> list[AlignmentEvaluation]:
+        if self.vlm is None:
+            raise RuntimeError("vlm evaluator unavailable")
+        if not images:
+            return []
+        if mode == "serialized":
+            if self._supports_vlm_single_call(self.vlm):
+                return [self._score_vlm_single(image, prompt, manifest) for image in images]
+            return self._score_vlm_batch(images, prompt, manifest)
+        if mode == "parallel":
+            if self._supports_vlm_single_call(self.vlm):
+                with ThreadPoolExecutor(max_workers=max(1, min(32, len(images)))) as executor:
+                    return list(executor.map(lambda image: self._score_vlm_single(image, prompt, manifest), images))
+            return self._score_vlm_batch(images, prompt, manifest)
+        return self._score_vlm_batch(images, prompt, manifest)
+
+    def _score_impact(
+        self,
+        images: list[EvaluationImageInput],
+        prompt: str,
+        manifest: Any,
+        mode: str,
+    ) -> list[dict[str, Any] | None]:
+        if self.impact is None:
+            return [None for _image in images]
+        if not images:
+            return []
+        if mode == "serialized":
+            if self._supports_path_single_call(self.impact):
+                return [self._impact_to_payload(self._score_impact_single(image, prompt, manifest)) for image in images]
+            return [self._impact_to_payload(result) for result in self._score_impact_batch(images, prompt, manifest)]
+        if mode == "parallel" and self._has_single_method(self.impact):
+            with ThreadPoolExecutor(max_workers=max(1, min(32, len(images)))) as executor:
+                return [
+                    self._impact_to_payload(result)
+                    for result in executor.map(lambda image: self._score_impact_single(image, prompt, manifest), images)
+                ]
+        return [self._impact_to_payload(result) for result in self._score_impact_batch(images, prompt, manifest)]
+
+    def _score_iqa_tensor_batch(
+        self,
+        images: list[EvaluationImageInput],
+        prompt: str,
+        manifest: Any,
+    ) -> list[QualityEvaluation]:
+        assert self.iqa is not None
+        for method_name in ("score_tensor_batch", "evaluate_tensor_batch"):
+            method = getattr(self.iqa, method_name, None)
+            if method is not None:
+                try:
+                    return list(method(images, prompt=prompt, manifest=manifest))
+                except TypeError:
+                    try:
+                        return list(method(images))
+                    except TypeError:
+                        return list(method([image.image_path for image in images]))
+        return self._score_iqa_batch(images, prompt, manifest)
+
+    def _score_iqa_batch(
+        self,
+        images: list[EvaluationImageInput],
+        prompt: str,
+        manifest: Any,
+    ) -> list[QualityEvaluation]:
+        assert self.iqa is not None
+        score = getattr(self.iqa, "score", None)
+        if score is not None:
+            return list(score(images))
+        evaluate = getattr(self.iqa, "evaluate", None)
+        if evaluate is not None:
+            return list(evaluate([image.image_path for image in images]))
+        raise RuntimeError("iqa evaluator does not expose score/evaluate")
+
+    def _score_iqa_single(
+        self,
+        image: EvaluationImageInput,
+        prompt: str,
+        manifest: Any,
+    ) -> QualityEvaluation:
+        assert self.iqa is not None
+        for method_name in ("score_one", "evaluate_one", "score_single", "evaluate_single"):
+            method = getattr(self.iqa, method_name, None)
+            if method is not None:
+                try:
+                    return method(image, prompt=prompt, manifest=manifest)
+                except TypeError:
+                    try:
+                        return method(image)
+                    except TypeError:
+                        return method(image.image_path)
+        return self._score_iqa_batch([image], prompt, manifest)[0]
+
+    def _score_vlm_batch(
+        self,
+        images: list[EvaluationImageInput],
+        prompt: str,
+        manifest: Any,
+    ) -> list[AlignmentEvaluation]:
+        assert self.vlm is not None
+        score = getattr(self.vlm, "score", None)
+        if score is not None:
+            return list(score(images))
+        evaluate = getattr(self.vlm, "evaluate", None)
+        if evaluate is not None:
+            return list(evaluate([image.image_path for image in images], prompt=prompt, manifest=self._adapter_manifest(manifest)))
+        raise RuntimeError("vlm evaluator does not expose score/evaluate")
+
+    def _score_vlm_single(
+        self,
+        image: EvaluationImageInput,
+        prompt: str,
+        manifest: Any,
+    ) -> AlignmentEvaluation:
+        assert self.vlm is not None
+        for method_name in ("score_one", "evaluate_one", "score_single", "evaluate_single"):
+            method = getattr(self.vlm, method_name, None)
+            if method is not None:
+                try:
+                    return method(image, prompt=prompt, manifest=manifest)
+                except TypeError:
+                    try:
+                        return method(image)
+                    except TypeError:
+                        return method(image.image_path, prompt=prompt, manifest=manifest)
+        evaluate = getattr(self.vlm, "evaluate", None)
+        if evaluate is not None:
+            return list(evaluate([image.image_path], prompt=prompt, manifest=self._adapter_manifest(manifest)))[0]
+        return self._score_vlm_batch([image], prompt, manifest)[0]
+
+    def _score_impact_batch(
+        self,
+        images: list[EvaluationImageInput],
+        prompt: str,
+        manifest: Any,
+    ) -> list[ImpactEvaluation | dict[str, Any] | None]:
+        assert self.impact is not None
+        score = getattr(self.impact, "score", None)
+        if score is not None:
+            return list(score(images))
+        evaluate = getattr(self.impact, "evaluate", None)
+        if evaluate is not None:
+            return list(evaluate([image.image_path for image in images]))
+        raise RuntimeError("impact evaluator does not expose score/evaluate")
+
+    def _score_impact_single(
+        self,
+        image: EvaluationImageInput,
+        prompt: str,
+        manifest: Any,
+    ) -> ImpactEvaluation | dict[str, Any] | None:
+        assert self.impact is not None
+        for method_name in ("score_one", "evaluate_one", "score_single", "evaluate_single"):
+            method = getattr(self.impact, method_name, None)
+            if method is not None:
+                try:
+                    return method(image, prompt=prompt, manifest=manifest)
+                except TypeError:
+                    try:
+                        return method(image)
+                    except TypeError:
+                        return method(image.image_path)
+        return self._score_impact_batch([image], prompt, manifest)[0]
+
+    @staticmethod
+    def _has_single_method(adapter: Any) -> bool:
+        return any(
+            getattr(adapter, method_name, None) is not None
+            for method_name in ("score_one", "evaluate_one", "score_single", "evaluate_single")
+        )
+
+    @classmethod
+    def _supports_path_single_call(cls, adapter: Any) -> bool:
+        return cls._has_single_method(adapter) or getattr(adapter, "evaluate", None) is not None
+
+    @classmethod
+    def _supports_vlm_single_call(cls, adapter: Any) -> bool:
+        return cls._supports_path_single_call(adapter)
+
+    @staticmethod
+    def _impact_to_payload(value: ImpactEvaluation | dict[str, Any] | None) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        if isinstance(value, dict):
+            return value
+        return value.model_dump()
+
+    @staticmethod
+    def _adapter_manifest(manifest: Any) -> Any:
+        if isinstance(manifest, EvaluationTargetManifest):
+            return manifest
+        if isinstance(manifest, dict):
+            try:
+                return EvaluationTargetManifest.model_validate(manifest)
+            except Exception:
+                return manifest
+        return manifest
+
+    def _unavailable_result(
+        self,
+        image: EvaluationImageInput,
+        plan: EvaluationPlan,
+        telemetry: dict[str, dict[str, Any]],
+    ) -> ImageEvaluationResult:
+        return ImageEvaluationResult(
+            candidate_id=image.candidate_id,
+            image_path=image.image_path,
+            seed=image.seed,
+            coordinate_id=image.coordinate_id,
+            run_id=image.run_id,
+            prompt_document_id=image.prompt_document_id,
+            target_manifest_id=image.target_manifest_id,
+            file_valid=True,
+            quality=QualityEvaluation(score=0.0, confidence="low"),
+            alignment=AlignmentEvaluation(score=0.0, confidence="low"),
+            impact=None,
+            evaluator_request_id=self.request_id,
+            evaluator_plan=plan,
+            evaluator_telemetry=telemetry,
+            evaluator_versions={},
+            pass_flags={"quality": False, "alignment": False, "full": False},
+            failure_types=["evaluator_unavailable"],
+            localized_blame=[],
+            disposition_signal=DispositionSignal(
+                class_name="infrastructure_retry_no_semantic_penalty",
+                confidence="high",
+                reasons=["evaluator unavailable"],
+            ),
+            confidence="low",
+        )
+
+    def _partial_vlm_failure_results(
+        self,
+        images: list[EvaluationImageInput],
+        quality_results: list[QualityEvaluation],
+        plan: EvaluationPlan,
+        iqa_telemetry: dict[str, Any],
+        vlm_telemetry: dict[str, Any],
+    ) -> list[ImageEvaluationResult]:
+        results: list[ImageEvaluationResult] = []
+        for image, quality in zip(images, quality_results, strict=True):
+            quality_pass = quality.score >= plan.quality_cutoff
+            if quality_pass:
+                failure_types: list[FailureType] = ["evaluator_unavailable"]
+                disposition = DispositionSignal(
+                    class_name="infrastructure_retry_no_semantic_penalty",
+                    confidence="high",
+                    reasons=["vlm evaluator unavailable"],
+                )
+                telemetry = {"iqa": iqa_telemetry, "vlm": vlm_telemetry}
+            else:
+                failure_types = ["quality_below_cutoff"]
+                disposition = DispositionSignal(
+                    class_name="fail_persist_for_learning",
+                    confidence="high",
+                    reasons=[str(failure) for failure in failure_types],
+                )
+                telemetry = {"iqa": iqa_telemetry}
+            results.append(
+                ImageEvaluationResult(
+                    candidate_id=image.candidate_id,
+                    image_path=image.image_path,
+                    seed=image.seed,
+                    coordinate_id=image.coordinate_id,
+                    run_id=image.run_id,
+                    prompt_document_id=image.prompt_document_id,
+                    target_manifest_id=image.target_manifest_id,
+                    file_valid=True,
+                    quality=quality,
+                    alignment=AlignmentEvaluation(score=0.0, confidence="low"),
+                    impact=None,
+                    evaluator_request_id=self.request_id,
+                    evaluator_plan=plan,
+                    evaluator_telemetry=telemetry,
+                    evaluator_versions={"iqa": _model_version(quality)},
+                    pass_flags={"quality": quality_pass, "alignment": False, "full": False},
+                    failure_types=failure_types,
+                    localized_blame=[],
+                    disposition_signal=disposition,
+                    confidence="low" if quality_pass else "high",
+                )
+            )
+        return results
+
+    def _quality_failure_result(
+        self,
+        image: EvaluationImageInput,
+        quality: QualityEvaluation,
+        plan: EvaluationPlan,
+        iqa_telemetry: dict[str, Any],
+    ) -> ImageEvaluationResult:
+        return ImageEvaluationResult(
+            candidate_id=image.candidate_id,
+            image_path=image.image_path,
+            seed=image.seed,
+            coordinate_id=image.coordinate_id,
+            run_id=image.run_id,
+            prompt_document_id=image.prompt_document_id,
+            target_manifest_id=image.target_manifest_id,
+            file_valid=True,
+            quality=quality,
+            alignment=AlignmentEvaluation(score=0.0, confidence="low"),
+            impact=None,
+            evaluator_request_id=self.request_id,
+            evaluator_plan=plan,
+            evaluator_telemetry={"iqa": iqa_telemetry},
+            evaluator_versions={"iqa": _model_version(quality)},
+            pass_flags={"quality": False, "alignment": False, "full": False},
+            failure_types=["quality_below_cutoff"],
+            localized_blame=[],
+            disposition_signal=DispositionSignal(
+                class_name="fail_persist_for_learning",
+                confidence="high",
+                reasons=["quality_below_cutoff"],
+            ),
+            confidence="high",
+        )
+
+    def _full_result(
+        self,
+        image: EvaluationImageInput,
+        quality: QualityEvaluation,
+        alignment: AlignmentEvaluation,
+        impact_payload: dict[str, Any] | None,
+        plan: EvaluationPlan,
+        iqa_telemetry: dict[str, Any],
+        vlm_telemetry: dict[str, Any],
+        impact_telemetry: dict[str, Any],
+        impact_enabled: bool,
+        impact_failed: bool,
+    ) -> ImageEvaluationResult:
+        quality_pass = quality.score >= plan.quality_cutoff
+        alignment_pass = alignment.score >= plan.alignment_cutoff
+        full_pass = quality_pass and alignment_pass
+        failure_types: list[FailureType] = [] if full_pass else ["alignment_below_cutoff"]
+        pass_flags = {"quality": quality_pass, "alignment": alignment_pass, "full": full_pass}
+        if impact_enabled and full_pass and plan.impact_cutoff is not None:
+            impact_score = impact_payload.get("score") if impact_payload is not None else None
+            impact_pass = isinstance(impact_score, (int, float)) and impact_score >= plan.impact_cutoff
+            pass_flags["impact"] = impact_pass
+            if not impact_pass:
+                failure_types.append("impact_below_cutoff" if impact_score is not None else "impact_unavailable")
+
+        evaluator_telemetry = {"iqa": iqa_telemetry, "vlm": vlm_telemetry}
+        evaluator_versions = {"iqa": _model_version(quality), "vlm": _model_version(alignment)}
+        if impact_failed and full_pass:
+            evaluator_telemetry["impact"] = impact_telemetry
+        if impact_payload is not None:
+            evaluator_telemetry["impact"] = impact_telemetry
+            evaluator_versions["impact"] = _model_version(impact_payload)
+
+        disposition = (
+            DispositionSignal(
+                class_name="passes_thresholds",
+                confidence="high",
+                reasons=["quality and alignment passed"],
+            )
+            if full_pass
+            else DispositionSignal(
+                class_name="fail_persist_for_learning",
+                confidence="high",
+                reasons=[str(failure) for failure in failure_types],
+            )
+        )
+        return ImageEvaluationResult(
+            candidate_id=image.candidate_id,
+            image_path=image.image_path,
+            seed=image.seed,
+            coordinate_id=image.coordinate_id,
+            run_id=image.run_id,
+            prompt_document_id=image.prompt_document_id,
+            target_manifest_id=image.target_manifest_id,
+            file_valid=True,
+            quality=quality,
+            alignment=alignment,
+            impact=impact_payload,
+            evaluator_request_id=self.request_id,
+            evaluator_plan=plan,
+            evaluator_telemetry=evaluator_telemetry,
+            evaluator_versions=evaluator_versions,
+            pass_flags=pass_flags,
+            failure_types=failure_types,
+            localized_blame=[],
+            disposition_signal=disposition,
+            confidence="high",
+        )
+
+    @staticmethod
+    def _attach_batch_metrics(
+        result: ImageEvaluationResult,
+        batch_metrics: dict[str, float | int],
+    ) -> ImageEvaluationResult:
+        telemetry = {**result.evaluator_telemetry, "batch": dict(batch_metrics)}
+        return result.model_copy(update={"evaluator_telemetry": telemetry})
+
+
 def _failure_for_target(target_id: str, target_kind: str) -> FailureType:
     if target_kind == "relation":
         return "missing_locked_relation"
@@ -294,7 +871,7 @@ def _failure_for_target(target_id: str, target_kind: str) -> FailureType:
     return "alignment_below_cutoff"
 
 
-def _model_version(model: QualityEvaluation | AlignmentEvaluation | dict[str, Any]) -> dict[str, str]:
+def _model_version(model: QualityEvaluation | AlignmentEvaluation | ImpactEvaluation | dict[str, Any]) -> dict[str, str]:
     if isinstance(model, dict):
         return {
             "model_id": str(model.get("model_id", "unknown")),
@@ -369,7 +946,11 @@ def apply_target_observations(
     disposition = (
         DispositionSignal(class_name="passes_thresholds", confidence="high", reasons=["target policy passed"])
         if alignment_pass
-        else DispositionSignal(class_name="fail_persist_for_learning", confidence="high", reasons=failure_types)
+        else DispositionSignal(
+            class_name="fail_persist_for_learning",
+            confidence="high",
+            reasons=[str(failure) for failure in failure_types],
+        )
     )
     return TargetPolicyResult(
         alignment=alignment,
@@ -451,7 +1032,11 @@ def evaluate_with_static_scores(
         disposition = (
             DispositionSignal(class_name="passes_thresholds", confidence="high", reasons=["quality and alignment passed"])
             if full_pass
-            else DispositionSignal(class_name="fail_persist_for_learning", confidence="high", reasons=failure_types)
+            else DispositionSignal(
+                class_name="fail_persist_for_learning",
+                confidence="high",
+                reasons=[str(failure) for failure in failure_types],
+            )
         )
         results.append(
             ImageEvaluationResult(
@@ -486,6 +1071,16 @@ def evaluate_images(
     vlm: StaticVLMAdapter,
     impact: StaticImpactAdapter | None = None,
 ) -> tuple[list[ImageEvaluationResult], list[str]]:
+    if request.evaluator_plan.execution_preference != "auto":
+        evaluator = BatchEvaluator(iqa=iqa, vlm=vlm, impact=impact, request_id=request.batch_id)
+        results = evaluator.evaluate(
+            request.images,
+            request.rendered_prompt,
+            request.target_manifest,
+            request.evaluator_plan,
+        )
+        return results, evaluator.last_survivor_candidate_ids
+
     iqa_telemetry = {"execution_mode": "batch", "elapsed_ms": 0}
     try:
         quality_results = iqa.score(request.images)
@@ -548,7 +1143,7 @@ def evaluate_images(
                 disposition = DispositionSignal(
                     class_name="fail_persist_for_learning",
                     confidence="high",
-                    reasons=failure_types,
+                    reasons=[str(failure) for failure in failure_types],
                 )
                 evaluator_telemetry = {"iqa": iqa_telemetry}
             results.append(
@@ -589,6 +1184,7 @@ def evaluate_images(
     impact_telemetry = {"execution_mode": "bounded_batch", "elapsed_ms": 0}
     impact_failed = False
     if impact_enabled:
+        assert impact is not None
         try:
             impact_payloads = impact.score(impact_images)
         except Exception as error:
@@ -621,7 +1217,7 @@ def evaluate_images(
             pass_flags = {"quality": quality_pass, "alignment": alignment_pass, "full": full_pass}
             if impact_enabled and full_pass and request.evaluator_plan.impact_cutoff is not None:
                 impact_score = impact_payload.get("score") if impact_payload is not None else None
-                impact_pass = impact_score is not None and impact_score >= request.evaluator_plan.impact_cutoff
+                impact_pass = isinstance(impact_score, (int, float)) and impact_score >= request.evaluator_plan.impact_cutoff
                 pass_flags["impact"] = impact_pass
                 if not impact_pass:
                     failure_types.append("impact_below_cutoff" if impact_score is not None else "impact_unavailable")
@@ -642,7 +1238,7 @@ def evaluate_images(
                 else DispositionSignal(
                     class_name="fail_persist_for_learning",
                     confidence="high",
-                    reasons=failure_types,
+                    reasons=[str(failure) for failure in failure_types],
                 )
             )
             results.append(

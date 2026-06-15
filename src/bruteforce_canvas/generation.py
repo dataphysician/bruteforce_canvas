@@ -8,6 +8,7 @@ from typing import Literal
 
 from pydantic import Field, model_validator
 
+from bruteforce_canvas.generator_registry import register_generator
 from bruteforce_canvas.shared import CoordinateId, DocId, RunId, StrictModel, TargetManifestId
 
 
@@ -262,6 +263,21 @@ def validate_image_file(path: Path) -> FileValidationResult:
     if header != b"\x89PNG\r\n\x1a\n":
         return FileValidationResult(valid=False, failure_type="invalid_image_file", reason="not a png header")
     return FileValidationResult(valid=True)
+
+
+@register_generator("stub")
+def build_stub_generator(config: object) -> StubGeneratorAdapter:
+    return StubGeneratorAdapter()
+
+
+@register_generator("bonsai")
+def build_bonsai_generator(config: object) -> BonsaiTernaryAdapter:
+    return BonsaiTernaryAdapter(
+        config=BonsaiTernaryConfig(
+            model_root=config.generator.bonsai_model_root,
+            triton_cache_dir=config.generator.bonsai_triton_cache_dir,
+        )
+    )
 
 
 class StubGeneratorAdapter:

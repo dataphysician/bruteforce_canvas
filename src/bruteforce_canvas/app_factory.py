@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from bruteforce_canvas.app_config import AppConfig, GeneratorKind
+from bruteforce_canvas.app_config import AppConfig
 from bruteforce_canvas.evaluation import EvaluationPlan, StaticIQAAdapter, StaticImpactAdapter, StaticVLMAdapter
 from bruteforce_canvas.generation import BonsaiTernaryAdapter, BonsaiTernaryConfig, StubGeneratorAdapter
+from bruteforce_canvas.generator_registry import GENERATOR_REGISTRY
 from bruteforce_canvas.persistence import JsonlEventStore
 from bruteforce_canvas.run_service import RunService
 from bruteforce_canvas.scheduler import EvaluatorStagePlan, plan_evaluator_stages
@@ -12,14 +13,8 @@ from bruteforce_canvas.worker import PersistentSeedSweepWorker
 
 
 def build_generator_adapter(config: AppConfig) -> StubGeneratorAdapter | BonsaiTernaryAdapter:
-    if config.generator.kind == GeneratorKind.BONSAI.value:
-        return BonsaiTernaryAdapter(
-            config=BonsaiTernaryConfig(
-                model_root=config.generator.bonsai_model_root,
-                triton_cache_dir=config.generator.bonsai_triton_cache_dir,
-            )
-        )
-    return StubGeneratorAdapter()
+    factory = GENERATOR_REGISTRY.get(config.generator.kind, GENERATOR_REGISTRY["stub"])
+    return factory(config)
 
 
 def build_event_store(config: AppConfig) -> JsonlEventStore:
