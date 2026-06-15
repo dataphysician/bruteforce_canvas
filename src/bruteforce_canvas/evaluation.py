@@ -106,6 +106,14 @@ class AlignmentEvaluation(StrictModel):
     confidence: Literal["high", "medium", "low"] = "high"
 
 
+class ImpactEvaluation(StrictModel):
+    score: float
+    model_id: str = "static-impact-evaluator"
+    model_version: str = "1"
+    confidence: Literal["high", "medium", "low"] = "high"
+    informational_only: bool = True
+
+
 class BlameHint(StrictModel):
     target_id: str | None = None
     field_path: str | None = None

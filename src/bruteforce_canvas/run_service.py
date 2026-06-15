@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from collections import deque
 
 from bruteforce_canvas.evaluation import ImageEvaluationResult
@@ -10,11 +11,13 @@ from bruteforce_canvas.orchestration import (
     RunConfig,
     RunCounters,
     RunRuntimeState,
+    RuntimeSnapshot,
     apply_candidate_feedback,
     build_stall_diagnostic,
 )
 from bruteforce_canvas.persistence import PERSISTENCE_VERSION, JsonlEventStore, PersistenceRecord, reconstruct_run_state
 from bruteforce_canvas.shared import FeedbackAction
+from bruteforce_canvas.telemetry import measure_vram_gib
 from bruteforce_canvas.ui import UIEvent
 from bruteforce_canvas.worker import PersistentSeedSweepWorker, SeedSweepWorkItem
 
@@ -42,6 +45,15 @@ class RunService:
     @property
     def state(self) -> RunRuntimeState:
         return self._state
+
+    def snapshot(self) -> RuntimeSnapshot:
+        return RuntimeSnapshot(
+            state=self._state,
+            counters=self._counters_from_store(),
+            pending_count=len(self._pending),
+            vram_gib=measure_vram_gib(),
+            snapshot_at=time.time(),
+        )
 
     def enqueue(self, item: SeedSweepWorkItem) -> None:
         self._pending.append(item)

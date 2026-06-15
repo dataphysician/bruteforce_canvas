@@ -17,6 +17,7 @@ ml = [
   "protobuf>=3.20",
   "pillow>=10.0",
   "gpytorch>=1.11",
+  "pynvml>=0.2",
 ]
 
 [tool.pytest.ini_options]

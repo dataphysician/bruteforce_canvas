@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from bruteforce_canvas.app_config import AppConfig, GeneratorKind
 from bruteforce_canvas.evaluation import EvaluationPlan, StaticIQAAdapter, StaticImpactAdapter, StaticVLMAdapter
 from bruteforce_canvas.generation import BonsaiTernaryAdapter, BonsaiTernaryConfig, StubGeneratorAdapter
@@ -55,3 +57,28 @@ def build_run_service(
         impact=impact,
     )
     return RunService(config=config.run, store=store, worker=worker)
+
+
+def prewarm_all(
+    *,
+    generator: Any,
+    iqa: Any | None = None,
+    vlm: Any | None = None,
+    impact: Any | None = None,
+) -> None:
+    """Invoke ``prewarm()`` on the generator and any real evaluator adapters.
+
+    Adapters that do not implement ``prewarm`` are silently skipped, so
+    the factory can call this unconditionally without coupling to the
+    G2-G4 real adapter rollout.  Static ``*Adapter`` doubles are valid
+    inputs because they all expose the ``prewarm`` method (or a no-op
+    equivalent).
+    """
+
+    for adapter in (generator, iqa, vlm, impact):
+        if adapter is None:
+            continue
+        prewarm = getattr(adapter, "prewarm", None)
+        if prewarm is None:
+            continue
+        prewarm()

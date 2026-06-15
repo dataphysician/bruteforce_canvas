@@ -17,6 +17,12 @@ class GeneratorKind(StrEnum):
     BONSAI = "bonsai"
 
 
+class DeviceKind(StrEnum):
+    CPU = "cpu"
+    CUDA = "cuda"
+    AUTO = "auto"
+
+
 class GeneratorConfig(StrictModel):
     kind: str = GeneratorKind.STUB.value
     bonsai_model_root: Path = Path("runtime/models/bonsai-image-4B-ternary-gemlite")
@@ -30,10 +36,23 @@ class GeneratorConfig(StrictModel):
         return self
 
 
+class DeviceConfig(StrictModel):
+    device: str = DeviceKind.AUTO.value
+    prewarm: bool = True
+
+    @model_validator(mode="after")
+    def validate_device(self) -> DeviceConfig:
+        allowed = {kind.value for kind in DeviceKind}
+        if self.device not in allowed:
+            raise ValueError(f"device must be one of {sorted(allowed)}")
+        return self
+
+
 class AppConfig(StrictModel):
     event_store_path: Path = Path("runtime/events.jsonl")
     openai_model: str = "gpt-4.1-mini"
     generator: GeneratorConfig = Field(default_factory=GeneratorConfig)
+    device: DeviceConfig = Field(default_factory=DeviceConfig)
     run: RunConfig = Field(
         default_factory=lambda: RunConfig(run_id="run_001", raw_user_prompt="configured run")
     )
@@ -62,6 +81,10 @@ def load_app_config(env: Mapping[str, str] | None = None) -> AppConfig:
         bonsai_model_root=Path(source.get("BC_BONSAI_MODEL_ROOT", "runtime/models/bonsai-image-4B-ternary-gemlite")),
         bonsai_triton_cache_dir=Path(source.get("BC_BONSAI_TRITON_CACHE", "runtime/.triton_cache")),
     )
+    device = DeviceConfig(
+        device=source.get("BC_DEVICE", DeviceKind.AUTO.value),
+        prewarm=source.get("BC_DEVICE_PREWARM", "true").lower() == "true",
+    )
     run = RunConfig(
         run_id=source.get("BC_RUN_ID", "run_001"),
         raw_user_prompt=source.get("BC_RAW_PROMPT", "configured run"),
@@ -79,6 +102,7 @@ def load_app_config(env: Mapping[str, str] | None = None) -> AppConfig:
         event_store_path=Path(source.get("BC_EVENT_STORE", "runtime/events.jsonl")),
         openai_model=source.get("BC_OPENAI_MODEL", "gpt-4.1-mini"),
         generator=generator,
+        device=device,
         run=run,
         hardware=HardwareTier(
             vram_gib=_int(source, "BC_VRAM_GIB", 0),

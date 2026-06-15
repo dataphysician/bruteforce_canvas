@@ -46,6 +46,14 @@ class RunCounters(StrictModel):
     elapsed_seconds: int = 0
 
 
+class RuntimeSnapshot(StrictModel):
+    state: RunRuntimeState
+    counters: RunCounters
+    pending_count: int
+    vram_gib: float
+    snapshot_at: float
+
+
 class RuntimeDecision(StrictModel):
     stop: bool = False
     next_state: RunRuntimeState | None = None
