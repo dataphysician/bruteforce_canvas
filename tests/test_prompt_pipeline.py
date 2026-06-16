@@ -138,6 +138,41 @@ def test_prompt_pipeline_runs_extract_canonicalize_verify_and_render():
     assert result.document.canonical_metadata["object.color.object_01"].enum_value == "RED"
 
 
+def test_prompt_pipeline_fast_mode_skips_semantic_verifier_and_repair_loops():
+    verifier = RecordingVerifier(
+        [
+            VerificationReport(
+                approved=False,
+                issues=[
+                    VerificationIssue(
+                        issue_type="missing_optional_detail",
+                        repair_scope="prompt_improvement",
+                        blocking=True,
+                        message="The prompt does not specify the color of the bench.",
+                    )
+                ],
+            )
+        ]
+    )
+    repairer = RecordingRepairer()
+
+    result = PromptPipeline(
+        RecordingExtractor(),
+        RecordingCanonicalizer(),
+        verifier,
+        repairer,
+        max_repairs=0,
+        max_semantic_repairs=0,
+        run_semantic_validation=False,
+        run_verifier=False,
+    ).run_spec("Create a clear image of a green ball on top of a bench.")
+
+    assert result.approved is True
+    assert result.rendered_prompt is not None
+    assert verifier.calls == 0
+    assert repairer.scopes == []
+
+
 def test_prompt_pipeline_repairs_only_blocking_issue_scope_before_reverify():
     issue = VerificationIssue(
         issue_type="descriptor_wrong_owner",

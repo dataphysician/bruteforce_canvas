@@ -3,7 +3,6 @@ name = "bruteforce-canvas"
 version = "0.1.0"
 description = "Spec-compliant (00-06) greenfield implementation of the Bruteforce Canvas PRD contracts"
 requires-python = ">=3.12"
-license = "CC-BY-NC-4.0"
 dependencies = [
   "pydantic>=2.11.10,<3",
 ]

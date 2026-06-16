@@ -20,8 +20,8 @@ from bruteforce_canvas.prompt import (
 from bruteforce_canvas.prompt_models import CinematographyLane, PromptDocumentSpec
 
 
-OPENAI_COMPATIBLE_SERVER_DEFAULT_BASE_URL = "https://dataphysician--mellum2-vllm-openai.modal.run/v1"
-OPENAI_COMPATIBLE_SERVER_DEFAULT_MODEL = "mellum2-thinking"
+OPENAI_COMPATIBLE_SERVER_DEFAULT_BASE_URL = "http://127.0.0.1:8000/v1"
+OPENAI_COMPATIBLE_SERVER_DEFAULT_MODEL = "json-reasoner"
 OPENAI_COMPATIBLE_SERVER_DEFAULT_TIMEOUT_SECONDS = 600.0
 
 

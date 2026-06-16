@@ -19,6 +19,7 @@ from bruteforce_canvas.llm_adapters import (
 )
 from bruteforce_canvas.llm_clients import OpenAICompatibleServerJsonLLMClient
 from bruteforce_canvas.persistence import JsonlEventStore
+from bruteforce_canvas.prompt_models import PromptDocumentSpec
 from bruteforce_canvas.prompt_pipeline import PromptPipeline
 from bruteforce_canvas.real_adapters import MiniCPMVAdapter, OpenAICompatibleVLMAlignmentAdapter
 from bruteforce_canvas.run_service import RunService
@@ -49,6 +50,40 @@ def build_json_llm_client(config: AppConfig) -> OpenAICompatibleServerJsonLLMCli
     )
 
 
+def prewarm_json_llm(config: AppConfig) -> dict:
+    """Run one low-stakes prompt-extraction inference against the configured LLM.
+
+    Runtime Gradio uses this before binding the UI so a Modal/vLLM cold start,
+    model load, kernel setup, and PromptDocumentSpec JSON-schema setup happen
+    before the first user submit.
+    """
+
+    warm_llm = config.llm.model_copy(
+        update={
+            "max_completion_tokens": min(config.llm.max_completion_tokens, 1024),
+            "temperature": 0.0,
+        }
+    )
+    warm_config = config.model_copy(update={"llm": warm_llm})
+    client = build_json_llm_client(warm_config)
+    payload = client.generate_json(
+        system=(
+            "Warm up prompt extraction for the runtime UI. Extract one graph-first PromptDocumentSpec from "
+            "the raw prompt with grounded evidence spans and no hidden reasoning."
+        ),
+        user={
+            "raw_prompt": (
+                "Generate a simple red ceramic cube resting on a matte wooden table, "
+                "studio lighting, centered composition."
+            )
+        },
+        schema_name=PromptDocumentSpec.__name__,
+    )
+    if not isinstance(payload, dict):
+        raise ValueError("LLM prewarm response must be a JSON object")
+    return payload
+
+
 def build_canonicalizer_adapter(
     config: AppConfig,
     *,
@@ -75,13 +110,25 @@ def build_canonicalizer_adapter(
     return embedding
 
 
-def build_prompt_pipeline(config: AppConfig) -> PromptPipeline:
+def build_prompt_pipeline(
+    config: AppConfig,
+    *,
+    extraction_validation_retries: int = 1,
+    max_repairs: int = 2,
+    max_semantic_repairs: int | None = None,
+    run_semantic_validation: bool = True,
+    run_verifier: bool = True,
+) -> PromptPipeline:
     client = build_json_llm_client(config)
     return PromptPipeline(
-        LLMPromptExtractionAdapter(client),
+        LLMPromptExtractionAdapter(client, max_validation_retries=extraction_validation_retries),
         build_canonicalizer_adapter(config, fallback_client=client),
         LLMVerificationAdapter(client),
         LLMRepairAdapter(client),
+        max_repairs=max_repairs,
+        max_semantic_repairs=max_semantic_repairs,
+        run_semantic_validation=run_semantic_validation,
+        run_verifier=run_verifier,
     )
 
 

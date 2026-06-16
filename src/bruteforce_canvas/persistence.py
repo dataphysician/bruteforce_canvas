@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -68,29 +69,32 @@ class ReconstructedRunState(StrictModel):
 class JsonlEventStore:
     def __init__(self, path: Path) -> None:
         self.path = path
+        self._lock = threading.RLock()
 
     def replay(self) -> list[PersistenceRecord]:
-        if not self.path.exists():
-            return []
-        records: list[PersistenceRecord] = []
-        for line in self.path.read_text(encoding="utf-8").splitlines():
-            if line.strip():
-                records.append(PersistenceRecord.model_validate_json(line))
-        return records
+        with self._lock:
+            if not self.path.exists():
+                return []
+            records: list[PersistenceRecord] = []
+            for line in self.path.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    records.append(PersistenceRecord.model_validate_json(line))
+            return records
 
     def append(self, record: PersistenceRecord) -> AppendResult:
-        existing = self.replay()
-        record_keys = {item.record_id for item in existing}
-        idempotency_keys = {item.idempotency_key for item in existing if item.idempotency_key is not None}
-        if record.record_id in record_keys or (
-            record.idempotency_key is not None and record.idempotency_key in idempotency_keys
-        ):
-            return AppendResult(written=False, record_id=record.record_id)
+        with self._lock:
+            existing = self.replay()
+            record_keys = {item.record_id for item in existing}
+            idempotency_keys = {item.idempotency_key for item in existing if item.idempotency_key is not None}
+            if record.record_id in record_keys or (
+                record.idempotency_key is not None and record.idempotency_key in idempotency_keys
+            ):
+                return AppendResult(written=False, record_id=record.record_id)
 
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(record.model_dump_json(exclude={"traceability_key"}) + "\n")
-        return AppendResult(written=True, record_id=record.record_id)
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(record.model_dump_json(exclude={"traceability_key"}) + "\n")
+            return AppendResult(written=True, record_id=record.record_id)
 
 
 def _unique_records(records: list[PersistenceRecord]) -> list[PersistenceRecord]:

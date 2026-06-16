@@ -92,6 +92,40 @@ def _spec_object_entries(document: PromptDocumentSpec) -> list[LockConfigEntry]:
     return entries
 
 
+def _spec_relation_entries(document: PromptDocumentSpec) -> list[LockConfigEntry]:
+    entries: list[LockConfigEntry] = []
+    for relation in document.graph.relations:
+        canonical = document.canonical_metadata.get(f"relation.{relation.id}")
+        relation_match = relation.relation_match
+        enum_value = None
+        canonical_status = CanonicalStatus.UNMATCHED_RAW_ONLY
+        lock_source = "prompt_document_spec"
+        if canonical is not None:
+            enum_value = canonical.enum_value
+            canonical_status = canonical.status
+            lock_source = "canonicalizer"
+        elif relation_match is not None:
+            enum_value = str(relation_match.enum_value) if relation_match.enum_value is not None else None
+            canonical_status = relation_match.status
+            lock_source = "relation_match"
+        entries.append(
+            LockConfigEntry(
+                field_path=f"relation.{relation.id}",
+                raw_value=relation.relation_raw,
+                enum_value=enum_value,
+                canonical_status=canonical_status,
+                priority="locked_required",
+                lhs_policy="fixed",
+                render_policy="use_raw_or_safe_raw_preserving_phrase",
+                evaluation_policy="must_match",
+                learning_policy="track_locked_reliability",
+                lock_state=LockState.LOCKED,
+                lock_source=lock_source,
+            )
+        )
+    return entries
+
+
 def _spec_constraint_entries(document: PromptDocumentSpec) -> list[LockConfigEntry]:
     entries: list[LockConfigEntry] = []
     for guardrail in document.constraint_lane.guardrails:
@@ -194,6 +228,7 @@ def build_default_lock_config(document: PromptDocumentSpec) -> LockConfiguration
         prompt_document_id=_document_id(document),
         entries=[
             *_spec_object_entries(document),
+            *_spec_relation_entries(document),
             *_spec_constraint_entries(document),
             *_spec_presentation_entries(document),
         ],

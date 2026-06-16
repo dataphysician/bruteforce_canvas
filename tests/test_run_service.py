@@ -18,22 +18,28 @@ from bruteforce_canvas.ui import (
 from bruteforce_canvas.worker import PersistentSeedSweepWorker, SeedSweepWorkItem
 
 
-def work_item(tmp_path: Path) -> SeedSweepWorkItem:
+def work_item(
+    tmp_path: Path,
+    *,
+    coordinate_id: str = "coord_001",
+    candidate_id_prefix: str | None = None,
+) -> SeedSweepWorkItem:
     requests = seed_sweep_requests(
         run_id="run_001",
         prompt_document_id="doc_001",
         target_manifest_id="eval_manifest_001",
-        coordinate_id="coord_001",
+        coordinate_id=coordinate_id,
         rendered_prompt="Generate a ceramic bowl on wooden table",
         generation_settings=GenerationSettings(),
-        output_dir=tmp_path,
+        output_dir=tmp_path / coordinate_id,
         generator_model_id="stub-generator",
         generator_backend="stub",
+        candidate_id_prefix=candidate_id_prefix,
     )
     return SeedSweepWorkItem(
         run_id="run_001",
         raw_user_prompt="a ceramic bowl on wooden table",
-        coordinate_id="coord_001",
+        coordinate_id=coordinate_id,
         rendered_prompt="Generate a ceramic bowl on wooden table",
         target_manifest={},
         generation_requests=requests,
@@ -311,6 +317,34 @@ def test_run_service_invokes_gate_chain_during_tick_with_pending_work(tmp_path: 
 
     assert "rendering" in run_service._gate_state.gates_passed
     assert run_service._gate_state.gates_failed == []
+
+
+def test_run_service_gates_only_pending_coordinate_records_across_continuous_batches(tmp_path: Path):
+    run_service = service(tmp_path)
+
+    for index in range(1, 4):
+        coordinate_id = f"coord_{index:03d}"
+        run_service.enqueue(
+            work_item(
+                tmp_path,
+                coordinate_id=coordinate_id,
+                candidate_id_prefix=f"cand_{coordinate_id}",
+            )
+        )
+        decision = run_service.tick()
+
+        assert decision.reason == "pending_coordinates"
+        assert decision.action == LoopAction.GENERATE_PENDING_COORDINATE
+
+    records = run_service.store.replay()
+    candidate_coordinates = {
+        record.coordinate_id
+        for record in records
+        if record.record_type == "candidate_record"
+    }
+
+    assert candidate_coordinates == {"coord_001", "coord_002", "coord_003"}
+    assert not any(record.record_type == "gate_blocked" for record in records)
 
 
 def test_run_service_persists_gate_blocked_record_when_generation_gate_fails(tmp_path: Path):

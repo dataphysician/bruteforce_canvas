@@ -75,3 +75,43 @@ def test_transcriber_uses_native_processor_generate_decode_flow():
     transcriber._load = lambda: (FakeProcessor(), FakeModel(), FakeTorch())  # type: ignore[method-assign]
 
     assert transcriber.transcribe((16000, np.zeros(1600, dtype=np.float32))) == "transcribed prompt"
+
+
+def test_transcriber_prewarm_loads_and_runs_silent_dummy_inference(monkeypatch):
+    calls = []
+
+    class FakeInputs(dict):
+        def to(self, **kwargs):
+            calls.append(("to", kwargs))
+            return self
+
+    class FakeProcessor:
+        def __call__(self, audio_array, **kwargs):
+            calls.append(("processor", audio_array.shape, kwargs))
+            return FakeInputs({"input_features": "features"})
+
+    class FakeModel:
+        device = "cuda:0"
+        dtype = "bf16"
+
+        def generate(self, **kwargs):
+            calls.append(("generate", kwargs))
+            return ["token_ids"]
+
+    class FakeTorch:
+        @staticmethod
+        def inference_mode():
+            return nullcontext()
+
+    monkeypatch.setenv("BC_ASR_PREWARM_MAX_NEW_TOKENS", "3")
+
+    transcriber = LocalCohereTranscriber()
+    transcriber._load = lambda: (FakeProcessor(), FakeModel(), FakeTorch())  # type: ignore[method-assign]
+
+    transcriber.prewarm()
+
+    assert calls[0][0] == "processor"
+    assert calls[0][1] == (16000,)
+    assert calls[0][2]["sampling_rate"] == 16000
+    assert calls[1] == ("to", {"device": "cuda:0", "dtype": "bf16"})
+    assert calls[2] == ("generate", {"input_features": "features", "max_new_tokens": 3})

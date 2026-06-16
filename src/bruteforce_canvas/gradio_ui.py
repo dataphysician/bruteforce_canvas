@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import gc
 import hashlib
 import os
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from html import escape
 from pathlib import Path
+from threading import RLock
 from typing import Any, Literal
 
 import gradio as gr
@@ -15,10 +18,17 @@ from pydantic import Field
 
 from bruteforce_canvas.app_config import AppConfig, GeneratorKind, load_app_config
 from bruteforce_canvas.app_controller import RunAppController
-from bruteforce_canvas.app_factory import build_evaluation_plan, build_prompt_pipeline, build_run_service, build_vlm_adapter
+from bruteforce_canvas.app_factory import (
+    build_evaluation_plan,
+    build_prompt_pipeline,
+    build_run_service,
+    build_vlm_adapter,
+    prewarm_json_llm,
+)
 from bruteforce_canvas.asr import default_transcriber
 from bruteforce_canvas.evaluation import EvaluationPlan, StaticIQAAdapter, StaticImpactAdapter, StaticVLMAdapter
 from bruteforce_canvas.generation import DEFAULT_SEED_BUNDLE, GenerationSettings, seed_sweep_requests
+from bruteforce_canvas.loop import LoopAction, LoopDecision
 from bruteforce_canvas.orchestration import RunConfig, RunRuntimeState
 from bruteforce_canvas.persistence import PERSISTENCE_VERSION, PersistenceRecord, reconstruct_run_state
 from bruteforce_canvas.prompt import (
@@ -33,6 +43,8 @@ from bruteforce_canvas.prompt import (
     target_manifest_from_prompt_spec,
 )
 from bruteforce_canvas.prompt_enums import (
+    CameraAngle,
+    ColorTreatment,
     ElementRole,
     EntityType,
     Finish,
@@ -54,7 +66,16 @@ from bruteforce_canvas.prompt_models import (
     RelationDescriptor,
     SceneGraphDraft,
 )
-from bruteforce_canvas.router import AxisDomain, FieldState, LHSRouter, RouterInput
+from bruteforce_canvas.router import (
+    AxisDomain,
+    CompatibilityMatrixRule,
+    CompatibilityPrior,
+    CompatibilitySeverity,
+    FieldState,
+    LHSRouter,
+    RouterInput,
+    ThompsonArmState,
+)
 from bruteforce_canvas.shared import FeedbackAction, StrictModel
 from bruteforce_canvas.ui import (
     CandidateCard,
@@ -76,7 +97,20 @@ COORDINATE_ID = "coord_001"
 RUNTIME_LOOP_LIMIT_SECONDS = 900
 RUNTIME_STALL_WINDOW_SECONDS = 600
 RUNTIME_STALL_MIN_PROMOTED = 10
-LOCK_TABLE_HEADERS = ["Locked", "Field", "Raw", "Enum", "LHS policy", "Status"]
+RUNTIME_STREAM_POLL_SECONDS = 0.5
+RUNTIME_FINAL_SEED_REFRESH_SECONDS = 0.35
+CATALOG_SLOT_COUNT = 8
+LOCK_TABLE_HEADERS = [
+    "Locked",
+    "Field",
+    "Raw",
+    "Selected Enum",
+    "Top LHS Choices",
+    "Arm Prior",
+    "Pair Prior",
+    "LHS policy",
+    "Status",
+]
 GradioMode = Literal["simulation", "runtime"]
 WORKFLOW_MERMAID_CODE = """%%{init: {"theme": "base", "flowchart": {"htmlLabels": false}, "themeVariables": {"primaryColor": "#eef8f6", "primaryTextColor": "#17211f", "primaryBorderColor": "#0f766e", "secondaryColor": "#fff8e6", "tertiaryColor": "#ffffff", "lineColor": "#17211f", "fontFamily": "Inter, ui-sans-serif, system-ui, sans-serif", "fontSize": "14px"}}}%%
 flowchart TD
@@ -108,6 +142,390 @@ flowchart TD
   class Mic,ASR,Typed,Prompt,Mellum,Parse,Canon,Locks,Coord,Seeds,Persist,Curated,Feedback,Priors,End step
   class IQA,VLM,Impact,Stop gate"""
 WORKFLOW_MERMAID_MARKDOWN = f"```mermaid\n{WORKFLOW_MERMAID_CODE}\n```"
+WORKFLOW_DIAGRAM_HTML = """
+<div class="bc-flow" role="img" aria-label="Bruteforce Canvas runtime workflow">
+  <svg class="bc-flow-svg" viewBox="0 0 1040 640" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <defs>
+      <marker id="bc-flow-arrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" />
+      </marker>
+      <marker id="bc-flow-arrow-loop" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" />
+      </marker>
+      <filter id="bc-flow-shadow" x="-10%" y="-12%" width="120%" height="130%">
+        <feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="#17211f" flood-opacity="0.10" />
+      </filter>
+    </defs>
+
+    <path class="bc-flow-edge" d="M230 91 H295" marker-end="url(#bc-flow-arrow)" />
+    <path class="bc-flow-edge" d="M485 91 H550" marker-end="url(#bc-flow-arrow)" />
+    <path class="bc-flow-edge" d="M740 91 H805" marker-end="url(#bc-flow-arrow)" />
+    <path class="bc-flow-edge" d="M900 138 V204" marker-end="url(#bc-flow-arrow)" />
+    <path class="bc-flow-edge" d="M805 251 H740" marker-end="url(#bc-flow-arrow)" />
+    <path class="bc-flow-edge" d="M550 251 H485" marker-end="url(#bc-flow-arrow)" />
+    <path class="bc-flow-edge" d="M295 251 H230" marker-end="url(#bc-flow-arrow)" />
+    <path class="bc-flow-edge" d="M135 314 V350" marker-end="url(#bc-flow-arrow)" />
+    <path class="bc-flow-edge" d="M230 412 H295" marker-end="url(#bc-flow-arrow)" />
+    <path class="bc-flow-edge" d="M485 412 H550" marker-end="url(#bc-flow-arrow)" />
+    <path class="bc-flow-edge" d="M740 411 H805" marker-end="url(#bc-flow-arrow)" />
+    <path class="bc-flow-edge" d="M900 458 V524" marker-end="url(#bc-flow-arrow)" />
+    <path class="bc-flow-edge" d="M805 571 H740" marker-end="url(#bc-flow-arrow)" />
+    <path class="bc-flow-edge" d="M550 571 H485" marker-end="url(#bc-flow-arrow)" />
+    <path class="bc-flow-edge" d="M295 572 H230" marker-end="url(#bc-flow-arrow)" />
+    <path class="bc-flow-edge bc-flow-edge-loop" d="M390 510 C390 450 645 430 645 298" marker-end="url(#bc-flow-arrow-loop)" />
+    <text class="bc-flow-edge-label" x="442" y="454">continue</text>
+
+    <g class="bc-flow-node" transform="translate(40 44)">
+      <title>CohereLabs/cohere-transcribe-03-2026 ASR path</title>
+      <rect width="190" height="94" rx="8" />
+      <text class="bc-flow-label" x="18" y="25">
+        <tspan class="bc-flow-kicker">ASR / TEXT</tspan>
+        <tspan class="bc-flow-title" x="18" dy="22">Audio/Text Prompt</tspan>
+        <tspan x="18" dy="18">Cohere Transcribe 03-2026</tspan>
+        <tspan x="18" dy="17">16 kHz en, max tokens 256</tspan>
+      </text>
+    </g>
+
+    <g class="bc-flow-node" transform="translate(295 44)">
+      <title>Mellum2 Thinking 12B via Modal Cloud</title>
+      <rect width="190" height="94" rx="8" />
+      <text class="bc-flow-label" x="18" y="25">
+        <tspan class="bc-flow-kicker">MELLUM2</tspan>
+        <tspan class="bc-flow-title" x="18" dy="22">Structured JSON</tspan>
+        <tspan x="18" dy="18">Mellum2 Thinking 12B</tspan>
+        <tspan x="18" dy="17">temp 0.0, tokens 2048</tspan>
+      </text>
+    </g>
+
+    <g class="bc-flow-node" transform="translate(550 44)">
+      <title>PromptDocument decomposition, repair, and verification</title>
+      <rect width="190" height="94" rx="8" />
+      <text class="bc-flow-label" x="18" y="25">
+        <tspan class="bc-flow-kicker">DECOMPOSITION</tspan>
+        <tspan class="bc-flow-title" x="18" dy="22">PromptDocument</tspan>
+        <tspan x="18" dy="18">Objects, relations, lanes</tspan>
+        <tspan x="18" dy="17">repair + verify signals</tspan>
+      </text>
+    </g>
+
+    <g class="bc-flow-node" transform="translate(805 44)">
+      <title>BAAI/bge-small-en-v1.5 enum canonicalizer</title>
+      <rect width="190" height="94" rx="8" />
+      <text class="bc-flow-label" x="18" y="25">
+        <tspan class="bc-flow-kicker">CANONICALIZATION</tspan>
+        <tspan class="bc-flow-title" x="18" dy="22">Enum mapping</tspan>
+        <tspan x="18" dy="18">BAAI/bge-small-en-v1.5</tspan>
+        <tspan x="18" dy="17">threshold 0.62</tspan>
+      </text>
+    </g>
+
+    <g class="bc-flow-node" transform="translate(805 204)">
+      <title>Pre-run locks and generation thresholds</title>
+      <rect width="190" height="94" rx="8" />
+      <text class="bc-flow-label" x="18" y="25">
+        <tspan class="bc-flow-kicker">LOCKS</tspan>
+        <tspan class="bc-flow-title" x="18" dy="22">Pre-run controls</tspan>
+        <tspan x="18" dy="18">Locked enum arms stay fixed</tspan>
+        <tspan x="18" dy="17">IQA .55, align .25</tspan>
+      </text>
+    </g>
+
+    <g class="bc-flow-node" transform="translate(550 204)">
+      <title>Latin hypercube coordinate routing with Thompson sampling and GP affinity</title>
+      <rect width="190" height="94" rx="8" />
+      <text class="bc-flow-label" x="18" y="25">
+        <tspan class="bc-flow-kicker">LATIN HYPERCUBE SAMPLING</tspan>
+        <tspan class="bc-flow-title" x="18" dy="22">Coordinate router</tspan>
+        <tspan x="18" dy="18">Coverage rows + Thompson</tspan>
+        <tspan x="18" dy="17">GP compatibility priors</tspan>
+      </text>
+    </g>
+
+    <g class="bc-flow-node" transform="translate(295 204)">
+      <title>prism-ml/bonsai-image-ternary-4B-gemlite-2bit generation adapter</title>
+      <rect width="190" height="94" rx="8" />
+      <text class="bc-flow-label" x="18" y="25">
+        <tspan class="bc-flow-kicker">GENERATION</tspan>
+        <tspan class="bc-flow-title" x="18" dy="22">Bonsai 5-seed batch</tspan>
+        <tspan x="18" dy="18">Ternary 4B, steps 4</tspan>
+        <tspan x="18" dy="17">512x512 preview sweep</tspan>
+      </text>
+    </g>
+
+    <g class="bc-flow-gate" transform="translate(40 190)">
+      <title>fancyfeast/joyquality-siglip2-so400m-512-16-05k047vn image quality gate</title>
+      <polygon points="95,0 190,62 95,124 0,62" />
+      <text class="bc-flow-gate-label" x="95" y="43" text-anchor="middle">
+        <tspan class="bc-flow-kicker">IQA</tspan>
+        <tspan class="bc-flow-title" x="95" dy="22">JoyQuality</tspan>
+        <tspan x="95" dy="18">score &gt;= 0.55</tspan>
+      </text>
+    </g>
+
+    <g class="bc-flow-gate" transform="translate(40 350)">
+      <title>openbmb/MiniCPM-V-4.6 visual alignment gate</title>
+      <polygon points="95,0 190,62 95,124 0,62" />
+      <text class="bc-flow-gate-label" x="95" y="43" text-anchor="middle">
+        <tspan class="bc-flow-kicker">VLM</tspan>
+        <tspan class="bc-flow-title" x="95" dy="22">MiniCPM-V-4.6</tspan>
+        <tspan x="95" dy="18">alignment &gt;= 0.25</tspan>
+      </text>
+    </g>
+
+    <g class="bc-flow-gate" transform="translate(295 350)">
+      <title>Jessylg27/tribev2-lite-qv optional impact adapter</title>
+      <polygon points="95,0 190,62 95,124 0,62" />
+      <text class="bc-flow-gate-label" x="95" y="43" text-anchor="middle">
+        <tspan class="bc-flow-kicker">TRIBE</tspan>
+        <tspan class="bc-flow-title" x="95" dy="22">v2 lite-qv</tspan>
+        <tspan x="95" dy="18">optional impact</tspan>
+      </text>
+    </g>
+
+    <g class="bc-flow-node" transform="translate(550 364)">
+      <title>Curated catalog promotion bands</title>
+      <rect width="190" height="94" rx="8" />
+      <text class="bc-flow-label" x="18" y="25">
+        <tspan class="bc-flow-kicker">CURATED CATALOG</tspan>
+        <tspan class="bc-flow-title" x="18" dy="22">Promotion bands</tspan>
+        <tspan x="18" dy="18">fragile 1, viable 2</tspan>
+        <tspan x="18" dy="17">strong 3+ promoted</tspan>
+      </text>
+    </g>
+
+    <g class="bc-flow-node" transform="translate(805 364)">
+      <title>Accept, reject, and shred feedback actions</title>
+      <rect width="190" height="94" rx="8" />
+      <text class="bc-flow-label" x="18" y="25">
+        <tspan class="bc-flow-kicker">FEEDBACK</tspan>
+        <tspan class="bc-flow-title" x="18" dy="22">Accept / reject</tspan>
+        <tspan x="18" dy="18">Human signal updates</tspan>
+        <tspan x="18" dy="17">backend feedback policy</tspan>
+      </text>
+    </g>
+
+    <g class="bc-flow-node" transform="translate(805 524)">
+      <title>Enum-arm alpha/beta priors and enum-combination GP affinity</title>
+      <rect width="190" height="94" rx="8" />
+      <text class="bc-flow-label" x="18" y="25">
+        <tspan class="bc-flow-kicker">PRIORS</tspan>
+        <tspan class="bc-flow-title" x="18" dy="22">Learned search</tspan>
+        <tspan x="18" dy="18">alpha/beta enum arms</tspan>
+        <tspan x="18" dy="17">combo GP affinity</tspan>
+      </text>
+    </g>
+
+    <g class="bc-flow-node" transform="translate(550 524)">
+      <title>Persistence stores candidate, gate, aggregate, feedback, prior, and stop evidence</title>
+      <rect width="190" height="94" rx="8" />
+      <text class="bc-flow-label" x="18" y="25">
+        <tspan class="bc-flow-kicker">PERSISTENCE</tspan>
+        <tspan class="bc-flow-title" x="18" dy="22">JSONL evidence</tspan>
+        <tspan x="18" dy="18">records candidates, gates</tspan>
+        <tspan x="18" dy="17">feedback, priors, stops</tspan>
+      </text>
+    </g>
+
+    <g class="bc-flow-gate" transform="translate(295 510)">
+      <title>Stop rules: 15-minute Gradio cap, fewer than 10 curated after 10 minutes, or backend/requested stop</title>
+      <polygon points="95,0 190,62 95,124 0,62" />
+      <text class="bc-flow-gate-label" x="95" y="43" text-anchor="middle">
+        <tspan class="bc-flow-kicker">STOP RULES</tspan>
+        <tspan class="bc-flow-title" x="95" dy="22">Runtime limits</tspan>
+        <tspan x="95" dy="18">cap / stall / stop</tspan>
+      </text>
+    </g>
+
+    <g class="bc-flow-node" transform="translate(40 524)">
+      <title>End run when a stop rule fires</title>
+      <rect width="190" height="94" rx="8" />
+      <text class="bc-flow-label" x="18" y="25">
+        <tspan class="bc-flow-kicker">END</tspan>
+        <tspan class="bc-flow-title" x="18" dy="22">Stop run</tspan>
+        <tspan x="18" dy="18">Final catalog remains</tspan>
+        <tspan x="18" dy="17">replayable from JSONL</tspan>
+      </text>
+    </g>
+  </svg>
+
+  <svg class="bc-flow-svg-mobile" viewBox="40 0 300 1710" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <defs>
+      <marker id="bc-flow-arrow-mobile" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" />
+      </marker>
+      <marker id="bc-flow-arrow-loop-mobile" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" />
+      </marker>
+      <filter id="bc-flow-shadow-mobile" x="-10%" y="-12%" width="120%" height="130%">
+        <feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="#17211f" flood-opacity="0.10" />
+      </filter>
+    </defs>
+
+    <path class="bc-flow-edge" d="M190 104 V130" marker-end="url(#bc-flow-arrow-mobile)" />
+    <path class="bc-flow-edge" d="M190 204 V230" marker-end="url(#bc-flow-arrow-mobile)" />
+    <path class="bc-flow-edge" d="M190 304 V330" marker-end="url(#bc-flow-arrow-mobile)" />
+    <path class="bc-flow-edge" d="M190 404 V430" marker-end="url(#bc-flow-arrow-mobile)" />
+    <path class="bc-flow-edge" d="M190 504 V530" marker-end="url(#bc-flow-arrow-mobile)" />
+    <path class="bc-flow-edge" d="M190 604 V630" marker-end="url(#bc-flow-arrow-mobile)" />
+    <path class="bc-flow-edge" d="M190 704 V730" marker-end="url(#bc-flow-arrow-mobile)" />
+    <path class="bc-flow-edge" d="M190 826 V850" marker-end="url(#bc-flow-arrow-mobile)" />
+    <path class="bc-flow-edge" d="M190 946 V970" marker-end="url(#bc-flow-arrow-mobile)" />
+    <path class="bc-flow-edge" d="M190 1066 V1090" marker-end="url(#bc-flow-arrow-mobile)" />
+    <path class="bc-flow-edge" d="M190 1164 V1190" marker-end="url(#bc-flow-arrow-mobile)" />
+    <path class="bc-flow-edge" d="M190 1264 V1290" marker-end="url(#bc-flow-arrow-mobile)" />
+    <path class="bc-flow-edge" d="M190 1364 V1390" marker-end="url(#bc-flow-arrow-mobile)" />
+    <path class="bc-flow-edge" d="M190 1464 V1490" marker-end="url(#bc-flow-arrow-mobile)" />
+    <path class="bc-flow-edge" d="M190 1586 V1610" marker-end="url(#bc-flow-arrow-mobile)" />
+    <path class="bc-flow-edge bc-flow-edge-loop" d="M315 1528 C330 1410 330 600 315 568" marker-end="url(#bc-flow-arrow-loop-mobile)" />
+    <text class="bc-flow-edge-label" x="278" y="1218">continue</text>
+
+    <g class="bc-flow-node" transform="translate(65 30)">
+      <title>CohereLabs/cohere-transcribe-03-2026 ASR path</title>
+      <rect width="250" height="74" rx="8" />
+      <text class="bc-flow-label" x="18" y="24">
+        <tspan class="bc-flow-kicker">ASR / TEXT</tspan>
+        <tspan class="bc-flow-title" x="18" dy="22">Audio/Text Prompt</tspan>
+        <tspan x="18" dy="18">Cohere Transcribe 03-2026</tspan>
+      </text>
+    </g>
+    <g class="bc-flow-node" transform="translate(65 130)">
+      <title>Mellum2 Thinking 12B via Modal Cloud</title>
+      <rect width="250" height="74" rx="8" />
+      <text class="bc-flow-label" x="18" y="24">
+        <tspan class="bc-flow-kicker">MELLUM2</tspan>
+        <tspan class="bc-flow-title" x="18" dy="22">Structured JSON</tspan>
+        <tspan x="18" dy="18">Mellum2 Thinking 12B</tspan>
+      </text>
+    </g>
+    <g class="bc-flow-node" transform="translate(65 230)">
+      <title>PromptDocument decomposition, repair, and verification</title>
+      <rect width="250" height="74" rx="8" />
+      <text class="bc-flow-label" x="18" y="24">
+        <tspan class="bc-flow-kicker">DECOMPOSITION</tspan>
+        <tspan class="bc-flow-title" x="18" dy="22">PromptDocument</tspan>
+        <tspan x="18" dy="18">objects, relations, lanes</tspan>
+      </text>
+    </g>
+    <g class="bc-flow-node" transform="translate(65 330)">
+      <title>BAAI/bge-small-en-v1.5 enum canonicalizer</title>
+      <rect width="250" height="74" rx="8" />
+      <text class="bc-flow-label" x="18" y="24">
+        <tspan class="bc-flow-kicker">CANONICALIZATION</tspan>
+        <tspan class="bc-flow-title" x="18" dy="22">Enum mapping</tspan>
+        <tspan x="18" dy="18">BAAI/bge-small-en-v1.5</tspan>
+      </text>
+    </g>
+    <g class="bc-flow-node" transform="translate(65 430)">
+      <title>Pre-run locks and generation thresholds</title>
+      <rect width="250" height="74" rx="8" />
+      <text class="bc-flow-label" x="18" y="24">
+        <tspan class="bc-flow-kicker">LOCKS</tspan>
+        <tspan class="bc-flow-title" x="18" dy="22">Pre-run controls</tspan>
+        <tspan x="18" dy="18">IQA .55, alignment .25</tspan>
+      </text>
+    </g>
+    <g class="bc-flow-node" transform="translate(65 530)">
+      <title>Latin hypercube coordinate routing with Thompson sampling and GP affinity</title>
+      <rect width="250" height="74" rx="8" />
+      <text class="bc-flow-label" x="18" y="24">
+        <tspan class="bc-flow-kicker">LATIN HYPERCUBE SAMPLING</tspan>
+        <tspan class="bc-flow-title" x="18" dy="22">Coordinate router</tspan>
+        <tspan x="18" dy="18">Thompson + GP priors</tspan>
+      </text>
+    </g>
+    <g class="bc-flow-node" transform="translate(65 630)">
+      <title>prism-ml/bonsai-image-ternary-4B-gemlite-2bit generation adapter</title>
+      <rect width="250" height="74" rx="8" />
+      <text class="bc-flow-label" x="18" y="24">
+        <tspan class="bc-flow-kicker">GENERATION</tspan>
+        <tspan class="bc-flow-title" x="18" dy="22">Bonsai 5-seed batch</tspan>
+        <tspan x="18" dy="18">steps 4, 512x512</tspan>
+      </text>
+    </g>
+    <g class="bc-flow-gate" transform="translate(65 730)">
+      <title>fancyfeast/joyquality-siglip2-so400m-512-16-05k047vn image quality gate</title>
+      <polygon points="125,0 250,48 125,96 0,48" />
+      <text class="bc-flow-gate-label" x="125" y="34" text-anchor="middle">
+        <tspan class="bc-flow-kicker">IQA</tspan>
+        <tspan class="bc-flow-title" x="125" dy="22">JoyQuality</tspan>
+        <tspan x="125" dy="18">score &gt;= 0.55</tspan>
+      </text>
+    </g>
+    <g class="bc-flow-gate" transform="translate(65 850)">
+      <title>openbmb/MiniCPM-V-4.6 visual alignment gate</title>
+      <polygon points="125,0 250,48 125,96 0,48" />
+      <text class="bc-flow-gate-label" x="125" y="34" text-anchor="middle">
+        <tspan class="bc-flow-kicker">VLM</tspan>
+        <tspan class="bc-flow-title" x="125" dy="22">MiniCPM-V-4.6</tspan>
+        <tspan x="125" dy="18">alignment &gt;= 0.25</tspan>
+      </text>
+    </g>
+    <g class="bc-flow-gate" transform="translate(65 970)">
+      <title>Jessylg27/tribev2-lite-qv optional impact adapter</title>
+      <polygon points="125,0 250,48 125,96 0,48" />
+      <text class="bc-flow-gate-label" x="125" y="34" text-anchor="middle">
+        <tspan class="bc-flow-kicker">TRIBE</tspan>
+        <tspan class="bc-flow-title" x="125" dy="22">v2 lite-qv</tspan>
+        <tspan x="125" dy="18">optional impact</tspan>
+      </text>
+    </g>
+    <g class="bc-flow-node" transform="translate(65 1090)">
+      <title>Curated catalog promotion bands</title>
+      <rect width="250" height="74" rx="8" />
+      <text class="bc-flow-label" x="18" y="24">
+        <tspan class="bc-flow-kicker">CURATED CATALOG</tspan>
+        <tspan class="bc-flow-title" x="18" dy="22">Promotion bands</tspan>
+        <tspan x="18" dy="18">fragile 1, viable 2, strong 3+</tspan>
+      </text>
+    </g>
+    <g class="bc-flow-node" transform="translate(65 1190)">
+      <title>Accept, reject, and shred feedback actions</title>
+      <rect width="250" height="74" rx="8" />
+      <text class="bc-flow-label" x="18" y="24">
+        <tspan class="bc-flow-kicker">FEEDBACK</tspan>
+        <tspan class="bc-flow-title" x="18" dy="22">Accept / reject / shred</tspan>
+        <tspan x="18" dy="18">human signal updates priors</tspan>
+      </text>
+    </g>
+    <g class="bc-flow-node" transform="translate(65 1290)">
+      <title>Enum-arm alpha/beta priors and enum-combination GP affinity</title>
+      <rect width="250" height="74" rx="8" />
+      <text class="bc-flow-label" x="18" y="24">
+        <tspan class="bc-flow-kicker">PRIORS</tspan>
+        <tspan class="bc-flow-title" x="18" dy="22">Learned search</tspan>
+        <tspan x="18" dy="18">alpha/beta + combo GP</tspan>
+      </text>
+    </g>
+    <g class="bc-flow-node" transform="translate(65 1390)">
+      <title>Persistence stores candidate, gate, aggregate, feedback, prior, and stop evidence</title>
+      <rect width="250" height="74" rx="8" />
+      <text class="bc-flow-label" x="18" y="24">
+        <tspan class="bc-flow-kicker">PERSISTENCE</tspan>
+        <tspan class="bc-flow-title" x="18" dy="22">JSONL evidence</tspan>
+        <tspan x="18" dy="18">candidates, gates, feedback</tspan>
+      </text>
+    </g>
+    <g class="bc-flow-gate" transform="translate(65 1490)">
+      <title>Stop rules: 15-minute Gradio cap, fewer than 10 curated after 10 minutes, or backend/requested stop</title>
+      <polygon points="125,0 250,48 125,96 0,48" />
+      <text class="bc-flow-gate-label" x="125" y="34" text-anchor="middle">
+        <tspan class="bc-flow-kicker">STOP RULES</tspan>
+        <tspan class="bc-flow-title" x="125" dy="22">Runtime limits</tspan>
+        <tspan x="125" dy="18">cap / stall / stop</tspan>
+      </text>
+    </g>
+    <g class="bc-flow-node" transform="translate(65 1610)">
+      <title>End run when a stop rule fires</title>
+      <rect width="250" height="74" rx="8" />
+      <text class="bc-flow-label" x="18" y="24">
+        <tspan class="bc-flow-kicker">END</tspan>
+        <tspan class="bc-flow-title" x="18" dy="22">Stop run</tspan>
+        <tspan x="18" dy="18">replayable from JSONL</tspan>
+      </text>
+    </g>
+  </svg>
+</div>
+"""
 WORKFLOW_EXPLANATION_MARKDOWN = """### Workflow Steps
 
 1. **ASR / text input** accepts typed prompts or microphone audio. The local ASR path uses `CohereLabs/cohere-transcribe-03-2026`, normalizes to `16 kHz`, defaults to English punctuation, and decodes with `max_new_tokens=256`.
@@ -115,7 +533,7 @@ WORKFLOW_EXPLANATION_MARKDOWN = """### Workflow Steps
 3. **Mellum2 Thinking 12B via Modal Cloud** supplies the structured JSON reasoning path for prompt extraction, repair, and verification through an OpenAI-compatible endpoint using `temperature=0.0`, strict schema output, and `max_completion_tokens=2048`.
 4. **Repair/Verify** checks blocking issues, unresolved targets, and threshold readiness before generation is allowed.
 5. **Canonicalization** maps raw prompt values to project enums with `BAAI/bge-small-en-v1.5`, `match_threshold=0.62`, and LLM fallback for uncertain matches.
-6. **LHS** proposes coverage-oriented coordinate rows across unlocked enum arms while preserving locked prompt evidence.
+6. **Latin Hypercube Sampling (LHS)** proposes coverage-oriented coordinate rows across unlocked enum arms while preserving locked prompt evidence.
 7. **Thompson Sampling/GP** ranks sampled arms with Bayesian feedback state, GP-style coordinate scoring, and compatibility priors as evaluation evidence accumulates.
 8. **Quick generation** uses `prism-ml/bonsai-image-ternary-4B-gemlite-2bit` through Bonsai local or HTTP adapters, with the fast preview path defaulting to `steps=4`, `512x512`, and seeds `[7, 42, 156, 8888, 42069]`.
 9. **IQA** filters each 5-seed batch with `fancyfeast/joyquality-siglip2-so400m-512-16-05k047vn` against the configured quality cutoff.
@@ -137,6 +555,59 @@ class RuntimeUISession:
 
 
 _RUNTIME_SESSIONS: dict[str, RuntimeUISession] = {}
+
+
+def _clear_worker_runtime_adapters(worker: Any) -> None:
+    if worker is None:
+        return
+    for attr in ("generator", "iqa", "vlm", "impact"):
+        if not hasattr(worker, attr):
+            continue
+        try:
+            setattr(worker, attr, None)
+        except Exception:
+            pass
+
+
+def _release_runtime_session(session: RuntimeUISession, *, reason: str) -> None:
+    try:
+        if getattr(session.service, "state", None) != RunRuntimeState.STOPPED:
+            session.service.request_stop()
+            session.service.stop_with_reason(reason, details={"run_id": session.config.run.run_id})
+    except Exception as error:
+        print(f"Runtime session stop failed during {reason}: {error}", flush=True)
+    _clear_worker_runtime_adapters(getattr(session.service, "worker", None))
+
+
+def _release_inactive_runtime_sessions(*, keep_run_id: str | None = None, reason: str) -> None:
+    stale_run_ids = [run_id for run_id in _RUNTIME_SESSIONS if run_id != keep_run_id]
+    if not stale_run_ids:
+        return
+    for run_id in stale_run_ids:
+        session = _RUNTIME_SESSIONS.pop(run_id, None)
+        if session is not None:
+            _release_runtime_session(session, reason=reason)
+    gc.collect()
+    try:
+        import torch
+
+        if bool(torch.cuda.is_available()):
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+@dataclass
+class ASRRuntimeStatus:
+    state: Literal["idle", "loading", "ready", "failed"] = "idle"
+    message: str = "Cohere Transcribe ASR has not loaded yet."
+    error: str | None = None
+    started_at: float | None = None
+    completed_at: float | None = None
+
+
+_ASR_RUNTIME_STATUS = ASRRuntimeStatus()
+_ASR_RUNTIME_STATUS_LOCK = RLock()
 
 
 class SimCandidate(StrictModel):
@@ -166,6 +637,7 @@ class GradioSimulationState(StrictModel):
     review: PreRunModalReadModel | None = None
     current_batch: list[SimCandidate] = Field(default_factory=list)
     curated: list[SimCandidate] = Field(default_factory=list)
+    catalog_page_index: int = 0
     selected_candidate_id: str | None = None
     generated_count: int = 0
     iqa_evaluated_count: int = 0
@@ -384,15 +856,203 @@ def _render_prompt_for_demo(document: PromptDocumentSpec) -> str:
     return render_prompt_spec(document).rendered_prompt
 
 
+RUNTIME_ENUM_DOMAINS: dict[str, list[str]] = {
+    "relation.": [member.name for member in RelationType],
+    "cinematography.shot_size": [member.name for member in ShotSize],
+    "cinematography.camera_angle": [member.name for member in CameraAngle],
+    "cinematography.lens": [member.name for member in OpticCharacter],
+    "cinematography.lighting_mood": [member.name for member in LightingMood],
+    "cinematography.color_treatment": [member.name for member in ColorTreatment],
+    "cinematography.composition": [member.name for member in Framing],
+}
+
+RUNTIME_ARM_PRIOR_OVERRIDES: dict[tuple[str, str], tuple[float, float]] = {
+    ("relation.", "ON_TOP_OF"): (7.0, 1.4),
+    ("relation.", "INSIDE"): (5.0, 1.8),
+    ("relation.", "NEXT_TO"): (4.5, 2.0),
+    ("cinematography.shot_size", "MEDIUM_SHOT"): (6.0, 1.6),
+    ("cinematography.shot_size", "WIDE_SHOT"): (4.2, 2.0),
+    ("cinematography.shot_size", "CLOSE_UP"): (3.8, 2.2),
+    ("cinematography.shot_size", "MEDIUM_CLOSE_UP"): (3.4, 2.3),
+    ("cinematography.camera_angle", "EYE_LEVEL"): (6.0, 1.5),
+    ("cinematography.camera_angle", "THREE_QUARTER"): (4.4, 1.9),
+    ("cinematography.camera_angle", "HIGH_ANGLE"): (3.2, 2.2),
+    ("cinematography.lens", "NATURAL_35MM"): (5.5, 1.6),
+    ("cinematography.lens", "PORTRAIT_50MM"): (4.4, 1.9),
+    ("cinematography.lens", "MACRO"): (3.5, 2.0),
+    ("cinematography.lighting_mood", "STUDIO_SOFTBOX"): (5.2, 1.7),
+    ("cinematography.lighting_mood", "SOFT_NATURAL"): (4.8, 1.8),
+    ("cinematography.lighting_mood", "GOLDEN_HOUR"): (3.7, 2.0),
+    ("cinematography.color_treatment", "NATURAL_COLOR"): (5.8, 1.5),
+    ("cinematography.color_treatment", "RICH_SATURATION"): (3.6, 2.2),
+    ("cinematography.color_treatment", "FILMIC_CONTRAST"): (3.5, 2.1),
+    ("cinematography.composition", "CENTERED"): (5.4, 1.6),
+    ("cinematography.composition", "RULE_OF_THIRDS"): (4.6, 1.8),
+    ("cinematography.composition", "SYMMETRICAL"): (3.4, 2.1),
+}
+
+
+def _enum_domain_key(field_path: str) -> str | None:
+    if field_path.startswith("relation."):
+        return "relation."
+    return field_path if field_path in RUNTIME_ENUM_DOMAINS else None
+
+
+def _enum_domain_values(field_path: str) -> list[str]:
+    domain_key = _enum_domain_key(field_path)
+    return RUNTIME_ENUM_DOMAINS.get(domain_key or "", [])
+
+
+def _runtime_arm_prior(axis: str, value: str, *, index: int = 0) -> tuple[float, float]:
+    domain_key = _enum_domain_key(axis) or axis
+    override = RUNTIME_ARM_PRIOR_OVERRIDES.get((domain_key, value)) or RUNTIME_ARM_PRIOR_OVERRIDES.get((axis, value))
+    if override is not None:
+        return override
+    alpha = max(1.2, 2.8 - min(index, 8) * 0.12)
+    beta = 2.4 + min(index, 8) * 0.10
+    return round(alpha, 2), round(beta, 2)
+
+
+def _runtime_arm_score(axis: str, value: str, *, index: int = 0) -> float:
+    alpha, beta = _runtime_arm_prior(axis, value, index=index)
+    return alpha / (alpha + beta)
+
+
+def _runtime_top_lhs_choices(field_path: str, *, limit: int = 3) -> list[tuple[str, float, float, float]]:
+    choices: list[tuple[str, float, float, float]] = []
+    for index, value in enumerate(_enum_domain_values(field_path)):
+        alpha, beta = _runtime_arm_prior(field_path, value, index=index)
+        score = alpha / (alpha + beta)
+        choices.append((value, alpha, beta, score))
+    return sorted(choices, key=lambda item: item[3], reverse=True)[:limit]
+
+
+def _format_lhs_choices(field_path: str) -> str:
+    choices = _runtime_top_lhs_choices(field_path)
+    if not choices:
+        return ""
+    return "; ".join(f"{value} {score:.0%}" for value, _alpha, _beta, score in choices)
+
+
+def _format_arm_prior(field_path: str) -> str:
+    choices = _runtime_top_lhs_choices(field_path, limit=1)
+    if not choices:
+        return ""
+    value, alpha, beta, score = choices[0]
+    return f"{value}: alpha {alpha:g}, beta {beta:g}, mean {score:.0%}"
+
+
+RUNTIME_PAIR_PRIOR_RULES: list[CompatibilityMatrixRule] = [
+    CompatibilityMatrixRule(
+        left_field="cinematography.shot_size",
+        left_value="CLOSE_UP",
+        right_field="cinematography.lens",
+        right_value="MACRO",
+        severity=CompatibilitySeverity.BOOST,
+        weight=0.18,
+        reason="close-up framing pairs well with macro detail.",
+    ),
+    CompatibilityMatrixRule(
+        left_field="cinematography.shot_size",
+        left_value="WIDE_SHOT",
+        right_field="cinematography.lens",
+        right_value="WIDE_ANGLE",
+        severity=CompatibilitySeverity.BOOST,
+        weight=0.14,
+        reason="wide shot and wide-angle lens preserve full scene context.",
+    ),
+    CompatibilityMatrixRule(
+        left_field="cinematography.lighting_mood",
+        left_value="STUDIO_SOFTBOX",
+        right_field="cinematography.color_treatment",
+        right_value="NATURAL_COLOR",
+        severity=CompatibilitySeverity.BOOST,
+        weight=0.12,
+        reason="studio softbox and natural color preserve product readability.",
+    ),
+    CompatibilityMatrixRule(
+        left_field="cinematography.camera_angle",
+        left_value="LOW_ANGLE",
+        right_field="cinematography.shot_size",
+        right_value="EXTREME_CLOSE_UP",
+        severity=CompatibilitySeverity.SOFT_DOWNRANK,
+        weight=-0.22,
+        reason="low angle with extreme close-up can hide object relationships.",
+    ),
+]
+
+OBJECT_LABEL_COLOR_TERMS = {
+    "black",
+    "blue",
+    "brown",
+    "cyan",
+    "gold",
+    "golden",
+    "gray",
+    "green",
+    "grey",
+    "magenta",
+    "maroon",
+    "navy",
+    "orange",
+    "pink",
+    "purple",
+    "red",
+    "silver",
+    "tan",
+    "teal",
+    "turquoise",
+    "violet",
+    "white",
+    "yellow",
+}
+OBJECT_LABEL_COLOR_MODIFIERS = {"bright", "dark", "deep", "light", "muted", "pale"}
+
+
+def _runtime_compatibility_prior() -> CompatibilityPrior:
+    default_prior = CompatibilityPrior()
+    return CompatibilityPrior(pair_rules=[*(default_prior.pair_rules or []), *RUNTIME_PAIR_PRIOR_RULES])
+
+
+def _format_pair_prior(field_path: str) -> str:
+    rules = [rule for rule in RUNTIME_PAIR_PRIOR_RULES if rule.left_field == field_path or rule.right_field == field_path]
+    if not rules:
+        return ""
+    labels = []
+    for rule in rules[:2]:
+        other_field = rule.right_field if rule.left_field == field_path else rule.left_field
+        other_value = rule.right_value if rule.left_field == field_path else rule.left_value
+        labels.append(f"{rule.severity}: {other_field}={other_value}")
+    return "; ".join(labels)
+
+
+def _selected_enum_display(entry: dict[str, object]) -> str:
+    enum_value = str(entry.get("enum_value") or "").strip()
+    if enum_value:
+        status = str(entry.get("canonical_status", ""))
+        if status == "matched_active":
+            return f"[selected] {enum_value}"
+        return enum_value
+    field_path = str(entry.get("field_path", ""))
+    choices = _runtime_top_lhs_choices(field_path, limit=1)
+    if choices:
+        return f"[suggested] {choices[0][0]}"
+    return ""
+
+
 def _lock_table_from_review(review: PreRunModalReadModel) -> list[list[Any]]:
     rows: list[list[Any]] = []
     for entry in review.lock_entries:
+        field_path = str(entry.get("field_path", ""))
         rows.append(
             [
                 str(entry.get("lock_state")) == "locked",
-                str(entry.get("field_path", "")),
+                field_path,
                 str(entry.get("raw_value") or ""),
-                str(entry.get("enum_value") or ""),
+                _selected_enum_display(entry),
+                _format_lhs_choices(field_path),
+                _format_arm_prior(field_path),
+                _format_pair_prior(field_path),
                 str(entry.get("lhs_policy", "")),
                 str(entry.get("canonical_status", "")),
             ]
@@ -408,6 +1068,14 @@ def _normal_lock_rows(lock_rows: Any) -> list[list[Any]]:
     if isinstance(lock_rows, dict):
         return [list(row) for row in lock_rows.get("data", [])]
     return [list(row) for row in lock_rows]
+
+
+def _clean_selected_enum_cell(value: object) -> str:
+    text = str(value or "").strip()
+    for prefix in ("[selected]", "[suggested]"):
+        if text.startswith(prefix):
+            return text[len(prefix) :].strip()
+    return text
 
 
 def _locked_field_count(lock_rows: Any) -> int:
@@ -533,6 +1201,29 @@ def _prompt_blocked_notification(
     return f"Prompt parse blocked: {reasons[0]} {retry_hint}{suggestion}"
 
 
+def _short_backend_error(error: BaseException | str, *, limit: int = 220) -> str:
+    text = " ".join(str(error).split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "..."
+
+
+def _runtime_parse_failed_document(raw_prompt: str, error: BaseException) -> PromptDocumentSpec:
+    document = build_prompt_document_for_demo(raw_prompt)
+    issue = VerificationIssue(
+        issue_type="prompt_parse_failed",
+        repair_scope="prompt_improvement",
+        blocking=True,
+        message=f"Prompt parser returned an invalid document shape: {_short_backend_error(error)}",
+    )
+    return document.model_copy(
+        update={
+            "raw_user_prompt": raw_prompt,
+            "verification": VerificationReport(approved=False, issues=[issue]),
+        }
+    )
+
+
 def _compiled_prompt_blocked_markup(raw_prompt: str, document: PromptDocumentSpec, review: PreRunModalReadModel) -> str:
     if review.can_begin_generation:
         return ""
@@ -557,46 +1248,102 @@ def _compiled_prompt_blocked_markup(raw_prompt: str, document: PromptDocumentSpe
     )
 
 
+def _display_object_label_and_inferred_color(label: str) -> tuple[str, str | None]:
+    words = label.strip().split()
+    if len(words) < 2:
+        return label, None
+    normalized = [word.strip(".,;:()[]{}").lower() for word in words]
+    if normalized[0] in OBJECT_LABEL_COLOR_TERMS:
+        return " ".join(words[1:]), words[0].strip(".,;:()[]{}")
+    if (
+        len(words) >= 3
+        and normalized[0] in OBJECT_LABEL_COLOR_MODIFIERS
+        and normalized[1] in OBJECT_LABEL_COLOR_TERMS
+    ):
+        return " ".join(words[2:]), f"{words[0].strip('.,;:()[]{}')} {words[1].strip('.,;:()[]{}')}"
+    return label, None
+
+
 def _review_markdown(raw_prompt: str, document: PromptDocumentSpec, review: PreRunModalReadModel, rendered: str) -> str:
     descriptor_by_target = {
         descriptor.target_id: descriptor.model_dump(exclude_none=True, mode="json")
         for descriptor in document.object_lane.objects
     }
-    element_cards = []
-    for element in document.graph.elements:
-        descriptor = descriptor_by_target.get(element.id, {})
+
+    element_by_id = {element.id: element for element in document.graph.elements}
+
+    def descriptor_markup_for(element_id: str, *, inferred_color: str | None = None) -> str:
+        descriptor = descriptor_by_target.get(element_id, {})
         descriptor_items = [
             f"{key.replace('_', ' ')}: {value}"
             for key, value in descriptor.items()
             if key != "target_id" and value is not None and value != "" and value != []
         ]
+        if inferred_color and not str(descriptor.get("color") or "").strip():
+            descriptor_items.insert(0, f"color: {inferred_color}")
         descriptor_markup = "".join(f'<span class="bc-token">{escape(str(item))}</span>' for item in descriptor_items)
         if not descriptor_markup:
             descriptor_markup = '<span class="bc-token bc-token-muted">no extra descriptors</span>'
-        element_cards.append(
-            '<article class="bc-object-card">'
-            f'<div class="bc-object-id">{escape(element.id)}: {escape(element.label)}</div>'
-            '<div class="bc-object-tags">'
-            f'<span>{escape(str(element.entity_type))}</span>'
-            f'<span>{escape(str(element.role))}</span>'
-            f'<span>{escape(str(element.importance))}</span>'
-            "</div>"
-            f'<div class="bc-object-meta">{descriptor_markup}</div>'
-            "</article>"
-        )
-    element_markup = "".join(element_cards) or '<p class="bc-muted">No parsed objects.</p>'
+        return descriptor_markup
 
-    relation_cards = []
+    def element_box(element_id: str) -> str:
+        element = element_by_id.get(element_id)
+        if element is None:
+            return (
+                '<div class="bc-triplet-box bc-triplet-object">'
+                '<span class="bc-triplet-kicker">Object</span>'
+                f"<strong>{escape(element_id)}</strong>"
+                '<small>unresolved reference</small>'
+                "</div>"
+            )
+        display_label, inferred_color = _display_object_label_and_inferred_color(str(element.label))
+        return (
+            '<div class="bc-triplet-box bc-triplet-object">'
+            '<span class="bc-triplet-kicker">Object</span>'
+            f"<strong>{escape(display_label)}</strong>"
+            f"<small>{escape(element.id)} | {escape(str(element.role))} | {escape(str(element.importance))}</small>"
+            f'<div class="bc-object-meta">{descriptor_markup_for(element.id, inferred_color=inferred_color)}</div>'
+            "</div>"
+        )
+
+    triplet_rows = []
+    related_ids: set[str] = set()
     for relation in document.graph.relations:
-        line = f"{relation.source_id} {relation.relation_raw} {relation.target_id}"
         enum_value = relation.relation_match.enum_value if relation.relation_match else "unmatched"
-        relation_cards.append(
-            '<article class="bc-relation-card">'
-            f'<div class="bc-relation-line">{escape(line)}</div>'
-            f'<div class="bc-relation-meta">canonical: {escape(str(enum_value))}</div>'
+        relation_label = str(relation.relation_raw or enum_value or "relation")
+        related_ids.update({relation.source_id, relation.target_id})
+        triplet_rows.append(
+            '<article class="bc-triplet-row">'
+            f"{element_box(relation.source_id)}"
+            '<div class="bc-triplet-box bc-triplet-relation">'
+            '<span class="bc-triplet-kicker">Relation</span>'
+            f"<strong>{escape(relation_label)}</strong>"
+            f"<small>canonical: {escape(str(enum_value))}</small>"
+            "</div>"
+            f"{element_box(relation.target_id)}"
             "</article>"
         )
-    relation_markup = "".join(relation_cards) or '<p class="bc-muted">No explicit relations.</p>'
+    triplet_markup = "".join(triplet_rows)
+    if not triplet_markup:
+        triplet_markup = '<p class="bc-muted">No explicit object relation object triplets.</p>'
+
+    standalone_objects = [
+        '<article class="bc-standalone-object">'
+        f"<strong>{escape(_display_object_label_and_inferred_color(str(element.label))[0])}</strong>"
+        f"<small>{escape(element.id)} | {escape(str(element.role))}</small>"
+        f'<div class="bc-object-meta">{descriptor_markup_for(element.id, inferred_color=_display_object_label_and_inferred_color(str(element.label))[1])}</div>'
+        "</article>"
+        for element in document.graph.elements
+        if element.id not in related_ids
+    ]
+    standalone_markup = ""
+    if standalone_objects:
+        standalone_markup = (
+            '<div class="bc-standalone-objects">'
+            '<div class="bc-eyebrow">Standalone objects</div>'
+            f"{''.join(standalone_objects)}"
+            "</div>"
+        )
 
     editable = "".join(f'<span class="bc-token">{escape(str(item))}</span>' for item in review.editable_fields)
     if not editable:
@@ -619,12 +1366,9 @@ def _review_markdown(raw_prompt: str, document: PromptDocumentSpec, review: PreR
         "</section>"
         '<section class="bc-review-grid">'
         '<article class="bc-review-block bc-review-block-wide">'
-        '<h3>Objects</h3>'
-        f'<div class="bc-object-grid">{element_markup}</div>'
-        "</article>"
-        '<article class="bc-review-block">'
-        '<h3>Relations</h3>'
-        f"{relation_markup}"
+        '<h3>Scene graph</h3>'
+        f'<div class="bc-triplet-stack">{triplet_markup}</div>'
+        f"{standalone_markup}"
         "</article>"
         '<article class="bc-review-block">'
         '<h3>Generation controls</h3>'
@@ -640,6 +1384,38 @@ def _review_markdown(raw_prompt: str, document: PromptDocumentSpec, review: PreR
         "</section>"
         "</div>"
     )
+
+
+def _runtime_batch_prompt_markup(session: RuntimeUISession, item: SeedSweepWorkItem, *, batch_index: int) -> str:
+    sampled = "".join(
+        f'<span class="bc-token">{escape(field_path)}={escape(value)}</span>'
+        for field_path, value in sorted(item.sampled_arms.items())
+    )
+    if not sampled:
+        sampled = '<span class="bc-token bc-token-muted">fixed coordinate</span>'
+    return (
+        '<article class="bc-batch-prompt">'
+        '<div class="bc-eyebrow">LHS candidate prompt</div>'
+        f"<h3>Batch {batch_index} · {escape(item.coordinate_id)}</h3>"
+        f'<pre class="bc-compiled-prompt">{escape(item.rendered_prompt)}</pre>'
+        f'<div class="bc-token-stack">{sampled}</div>'
+        "</article>"
+    )
+
+
+def _runtime_review_markup(
+    session: RuntimeUISession,
+    state: GradioSimulationState,
+    *,
+    item: SeedSweepWorkItem | None = None,
+    batch_index: int | None = None,
+) -> str:
+    review = state.review or pre_run_modal_from_prompt(session.document)
+    rendered_prompt = item.rendered_prompt if item is not None else state.rendered_prompt or session.rendered_prompt.rendered_prompt
+    base_markup = _review_markdown(session.config.run.raw_user_prompt, session.document, review, rendered_prompt)
+    if item is None or batch_index is None:
+        return base_markup
+    return _runtime_batch_prompt_markup(session, item, batch_index=batch_index) + base_markup
 
 
 def _candidate_digest(raw_prompt: str, seed: int, batch_index: int, salt: str) -> float:
@@ -736,6 +1512,79 @@ def _write_candidate_image(
     return str(path)
 
 
+def _seed_slot_dir(run_id: str, batch_index: int) -> Path:
+    path = RUNTIME_RUN_ROOT / run_id / "images" / "_seed_slots" / f"batch_{batch_index:03d}"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _slot_base_image() -> Image.Image:
+    return Image.new("RGB", (768, 1024), (22, 28, 32))
+
+
+def _draw_slot_chrome(
+    draw: ImageDraw.ImageDraw,
+    *,
+    seed: int,
+    status: str,
+    border: tuple[int, int, int],
+    label_fill: tuple[int, int, int],
+) -> None:
+    draw.rectangle((0, 0, 767, 1023), outline=border, width=16)
+    draw.rounded_rectangle((42, 42, 246, 104), radius=10, fill=label_fill)
+    draw.text((66, 62), f"seed {seed}", fill=(255, 255, 255))
+    draw.text((54, 140), status.upper(), fill=border)
+
+
+def _write_seed_slot_placeholder(*, run_id: str, batch_index: int, seed: int) -> str:
+    path = _seed_slot_dir(run_id, batch_index) / f"seed_{seed}_pending.png"
+    if path.exists():
+        return str(path)
+    image = _slot_base_image()
+    draw = ImageDraw.Draw(image)
+    for offset in range(-1024, 1024, 52):
+        draw.line((offset, 1024, offset + 1024, 0), fill=(37, 45, 50), width=7)
+    draw.rounded_rectangle((64, 330, 704, 602), radius=22, fill=(31, 39, 44), outline=(78, 96, 99), width=4)
+    draw.ellipse((318, 414, 450, 546), outline=(126, 146, 149), width=8)
+    _draw_slot_chrome(
+        draw,
+        seed=seed,
+        status="waiting for image",
+        border=(126, 146, 149),
+        label_fill=(69, 84, 88),
+    )
+    image.save(path)
+    return str(path)
+
+
+def _write_failed_seed_slot(*, run_id: str, batch_index: int, candidate: SimCandidate) -> str:
+    path = _seed_slot_dir(run_id, batch_index) / f"{candidate.candidate_id}_failed.png"
+    if path.exists():
+        return str(path)
+    try:
+        image = Image.open(candidate.display_path).convert("RGB").resize((768, 1024))
+    except Exception:
+        image = _slot_base_image()
+    image = ImageEnhance.Color(image).enhance(0.10)
+    image = ImageEnhance.Brightness(image).enhance(0.28)
+    overlay = Image.new("RGBA", image.size, (5, 8, 10, 118))
+    image = Image.alpha_composite(image.convert("RGBA"), overlay).convert("RGB")
+    draw = ImageDraw.Draw(image)
+    draw.line((96, 196, 672, 772), fill=(216, 38, 38), width=30)
+    draw.line((672, 196, 96, 772), fill=(216, 38, 38), width=30)
+    draw.rounded_rectangle((168, 802, 600, 900), radius=14, fill=(28, 8, 8), outline=(216, 38, 38), width=6)
+    draw.text((262, 834), "PURGED", fill=(255, 236, 236))
+    _draw_slot_chrome(
+        draw,
+        seed=candidate.seed,
+        status="failed gate",
+        border=(216, 38, 38),
+        label_fill=(150, 28, 28),
+    )
+    image.save(path)
+    return str(path)
+
+
 def _make_pending_batch(state: GradioSimulationState, lock_rows: Any) -> list[SimCandidate]:
     batch_index = state.batch_index + 1
     coordinate_id = f"coord_{batch_index:03d}"
@@ -803,18 +1652,53 @@ def _evaluate_batch(
     return evaluated
 
 
-def _preview_gallery(candidates: list[SimCandidate]) -> list[tuple[str, str]]:
+def _preview_gallery(
+    candidates: list[SimCandidate],
+    *,
+    expected_seeds: list[int] | None = None,
+    run_id: str = RUN_ID,
+    batch_index: int = 0,
+) -> list[tuple[str, str]]:
     gallery = []
-    for candidate in candidates:
+    by_seed = {candidate.seed: candidate for candidate in candidates}
+    ordered_seeds = expected_seeds or [candidate.seed for candidate in candidates]
+    for seed in ordered_seeds:
+        candidate = by_seed.get(seed)
+        if candidate is None:
+            gallery.append(
+                (
+                    _write_seed_slot_placeholder(run_id=run_id, batch_index=batch_index, seed=seed),
+                    f"seed {seed} | waiting for image",
+                )
+            )
+            continue
         if candidate.outcome == "pending":
-            caption = f"seed {candidate.seed} | pending"
+            caption = f"seed {candidate.seed} | generated, evaluating"
+            image_path = candidate.display_path
         elif candidate.outcome == "failed":
             reasons = ", ".join(candidate.failure_reasons) or "failed"
             caption = f"seed {candidate.seed} | failed | {reasons}"
+            image_path = _write_failed_seed_slot(run_id=run_id, batch_index=batch_index, candidate=candidate)
         else:
             caption = f"seed {candidate.seed} | {candidate.outcome} | Q {candidate.quality_score:.2f} A {candidate.alignment_score:.2f}"
-        gallery.append((candidate.display_path, caption))
+            image_path = candidate.display_path
+        gallery.append((image_path, caption))
     return gallery
+
+
+def _preview_slot_paths(state: GradioSimulationState) -> list[str | None]:
+    if not state.current_batch and not state.current_batch_expected_seeds:
+        return [None for _seed in DEFAULT_SEED_BUNDLE]
+    gallery = _preview_gallery(
+        state.current_batch,
+        expected_seeds=state.current_batch_expected_seeds,
+        run_id=state.run_id,
+        batch_index=state.batch_index,
+    )
+    paths = [path for path, _caption in gallery[: len(DEFAULT_SEED_BUNDLE)]]
+    if len(paths) < len(DEFAULT_SEED_BUNDLE):
+        paths.extend(None for _seed in DEFAULT_SEED_BUNDLE[len(paths) :])
+    return paths
 
 
 def _visible_catalog(state: GradioSimulationState) -> list[SimCandidate]:
@@ -832,6 +1716,83 @@ def _catalog_gallery(state: GradioSimulationState) -> list[tuple[str, str]]:
             )
         )
     return items
+
+
+def _catalog_gallery_update(state: GradioSimulationState, *, clear: bool = False):
+    return gr.update(value=[] if clear else _catalog_gallery(state))
+
+
+def _catalog_page_count(state: GradioSimulationState) -> int:
+    visible_count = len(_visible_catalog(state))
+    return max(1, (visible_count + CATALOG_SLOT_COUNT - 1) // CATALOG_SLOT_COUNT)
+
+
+def _clamp_catalog_page_index(state: GradioSimulationState) -> int:
+    return min(max(int(state.catalog_page_index), 0), _catalog_page_count(state) - 1)
+
+
+def _catalog_page_window(state: GradioSimulationState) -> tuple[int, int]:
+    page_index = _clamp_catalog_page_index(state)
+    start = page_index * CATALOG_SLOT_COUNT
+    end = start + CATALOG_SLOT_COUNT
+    return start, end
+
+
+def _catalog_slot_paths(state: GradioSimulationState, *, clear: bool = False) -> list[str | None]:
+    if clear:
+        return [None for _index in range(CATALOG_SLOT_COUNT)]
+    start, end = _catalog_page_window(state)
+    paths = [candidate.display_path for candidate in _visible_catalog(state)[start:end]]
+    if len(paths) < CATALOG_SLOT_COUNT:
+        paths.extend(None for _index in range(CATALOG_SLOT_COUNT - len(paths)))
+    return paths
+
+
+def _catalog_page_label(state: GradioSimulationState) -> str:
+    visible_count = len(_visible_catalog(state))
+    if visible_count == 0:
+        return "Curated catalog: 0 images"
+    page_index = _clamp_catalog_page_index(state)
+    start = page_index * CATALOG_SLOT_COUNT + 1
+    end = min((page_index + 1) * CATALOG_SLOT_COUNT, visible_count)
+    return f"Curated catalog: {start}-{end} of {visible_count}"
+
+
+def _catalog_page_controls(state: GradioSimulationState) -> tuple[Any, Any, str]:
+    page_index = _clamp_catalog_page_index(state)
+    page_count = _catalog_page_count(state)
+    return (
+        gr.update(interactive=page_index > 0),
+        gr.update(interactive=page_index < page_count - 1),
+        _catalog_page_label(state),
+    )
+
+
+def _clamp_catalog_page_state(state: GradioSimulationState) -> GradioSimulationState:
+    clamped = _clamp_catalog_page_index(state)
+    if clamped == state.catalog_page_index:
+        return state
+    return state.model_copy(update={"catalog_page_index": clamped})
+
+
+def _detail_image_update(candidate: SimCandidate | None, *, clear: bool = False):
+    return gr.update(value=None if clear or candidate is None else candidate.display_path)
+
+
+def _catalog_gallery_signature(state: GradioSimulationState) -> tuple[tuple[str, str, str], ...]:
+    return tuple(
+        (candidate.candidate_id, candidate.display_path, candidate.feedback_state or "")
+        for candidate in _visible_catalog(state)
+    )
+
+
+def _runtime_catalog_signature_from_records(records: list[PersistenceRecord]) -> tuple[tuple[str, str, str], ...]:
+    candidates = _runtime_candidates_from_records(records)
+    return tuple(
+        (candidate.candidate_id, candidate.display_path, candidate.feedback_state or "")
+        for candidate in candidates
+        if candidate.promoted and candidate.feedback_state not in {"reject", "shred"}
+    )
 
 
 def _workspace_model(state: GradioSimulationState) -> RunWorkspaceReadModel:
@@ -948,21 +1909,183 @@ def _resolve_gradio_mode(mode: GradioMode | str | None = None) -> GradioMode:
     return requested  # type: ignore[return-value]
 
 
-def _zero_gpu_callbacks_enabled() -> bool:
-    return os.environ.get("BC_ZEROGPU_CALLBACKS", "auto").lower() not in {"0", "false", "no", "off"}
+def _env_flag(name: str, *, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
-def _maybe_zero_gpu(function: Any, *, duration: int) -> Any:
-    if not _zero_gpu_callbacks_enabled():
-        return function
+def _env_int(name: str, *, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return int(value)
+
+
+def _short_asr_error(error: BaseException | str, *, limit: int = 260) -> str:
+    text = " ".join(str(error).split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "..."
+
+
+def _set_asr_runtime_status(
+    state: Literal["idle", "loading", "ready", "failed"],
+    message: str,
+    *,
+    error: BaseException | str | None = None,
+) -> ASRRuntimeStatus:
+    now = time.monotonic()
+    with _ASR_RUNTIME_STATUS_LOCK:
+        _ASR_RUNTIME_STATUS.state = state
+        _ASR_RUNTIME_STATUS.message = message
+        _ASR_RUNTIME_STATUS.error = _short_asr_error(error) if error is not None else None
+        if state == "loading":
+            _ASR_RUNTIME_STATUS.started_at = now
+            _ASR_RUNTIME_STATUS.completed_at = None
+        elif state in {"ready", "failed", "idle"}:
+            _ASR_RUNTIME_STATUS.completed_at = now
+        return ASRRuntimeStatus(
+            state=_ASR_RUNTIME_STATUS.state,
+            message=_ASR_RUNTIME_STATUS.message,
+            error=_ASR_RUNTIME_STATUS.error,
+            started_at=_ASR_RUNTIME_STATUS.started_at,
+            completed_at=_ASR_RUNTIME_STATUS.completed_at,
+        )
+
+
+def _asr_runtime_status_snapshot() -> ASRRuntimeStatus:
+    with _ASR_RUNTIME_STATUS_LOCK:
+        return ASRRuntimeStatus(
+            state=_ASR_RUNTIME_STATUS.state,
+            message=_ASR_RUNTIME_STATUS.message,
+            error=_ASR_RUNTIME_STATUS.error,
+            started_at=_ASR_RUNTIME_STATUS.started_at,
+            completed_at=_ASR_RUNTIME_STATUS.completed_at,
+        )
+
+
+def _asr_transcription_block_message() -> str | None:
+    status = _asr_runtime_status_snapshot()
+    if status.state == "loading":
+        return "Cohere Transcribe ASR is still warming up. Your recording is kept; try again when ASR is ready."
+    if status.state == "failed":
+        detail = f" Reason: {status.error or status.message}" if (status.error or status.message) else ""
+        return (
+            "Cohere Transcribe ASR is unavailable because preload failed."
+            f"{detail} You can type the prompt, or restart after freeing GPU memory."
+        )
+    if (
+        status.state == "idle"
+        and "released" in status.message.lower()
+        and _env_flag("BC_ASR_PREWARM", default=True)
+    ):
+        return (
+            "Cohere Transcribe ASR was released to free GPU memory for generation. "
+            "Use the text prompt, or restart the runtime UI before recording again."
+        )
+    return None
+
+
+def _asr_release_after_transcribe_enabled() -> bool:
+    if "BC_ASR_RELEASE_AFTER_TRANSCRIBE" in os.environ:
+        return _env_flag("BC_ASR_RELEASE_AFTER_TRANSCRIBE", default=False)
+    if "BC_ASR_KEEP_LOADED_AFTER_TRANSCRIBE" in os.environ:
+        return not _env_flag("BC_ASR_KEEP_LOADED_AFTER_TRANSCRIBE", default=True)
+    return False
+
+
+def _asr_release_before_runtime_service_enabled() -> bool:
+    return _env_flag("BC_ASR_RELEASE_BEFORE_RUNTIME_SERVICE", default=False) or _env_flag(
+        "BC_ASR_RELEASE_BEFORE_GENERATION", default=False
+    )
+
+
+def _unload_runtime_asr(reason: str) -> None:
+    status = _asr_runtime_status_snapshot()
+    if status.state not in {"ready", "loading"}:
+        return
     try:
-        import spaces
-    except Exception:
-        return function
-    gpu = getattr(spaces, "GPU", None)
-    if gpu is None:
-        return function
-    return gpu(duration=duration)(function)
+        unload = getattr(default_transcriber(), "unload", None)
+        if unload is not None:
+            unload()
+    except Exception as error:
+        print(f"Cohere Transcribe ASR unload failed after {reason}: {error}", flush=True)
+        return
+    _set_asr_runtime_status("idle", f"Cohere Transcribe ASR released after {reason}.")
+    print(f"Cohere Transcribe ASR released after {reason}.", flush=True)
+
+
+def _prewarm_runtime_llm_if_enabled(mode: GradioMode | str) -> None:
+    if _resolve_gradio_mode(mode) != "runtime":
+        return
+    if not _env_flag("BC_LLM_PREWARM", default=True):
+        return
+
+    config = load_app_config()
+    started = time.monotonic()
+    print(
+        f"Prewarming prompt LLM before runtime UI launch: model={config.llm.model} base_url={config.llm.base_url}",
+        flush=True,
+    )
+    try:
+        prewarm_json_llm(config)
+    except Exception as error:
+        if _env_flag("BC_LLM_PREWARM_REQUIRED", default=False):
+            raise
+        print(f"Prompt LLM prewarm failed; continuing runtime UI launch: {error}", flush=True)
+        return
+    elapsed = time.monotonic() - started
+    print(f"Prompt LLM prewarm complete in {elapsed:.1f}s.", flush=True)
+
+
+def _prewarm_runtime_asr_if_enabled(mode: GradioMode | str) -> None:
+    if _resolve_gradio_mode(mode) != "runtime":
+        return
+    if not _env_flag("BC_ASR_PREWARM", default=True):
+        _set_asr_runtime_status("idle", "Cohere Transcribe ASR prewarm is disabled.")
+        return
+
+    transcriber = default_transcriber()
+    started = time.monotonic()
+    _set_asr_runtime_status("loading", "Cohere Transcribe ASR is warming up.")
+    print(
+        f"Prewarming Cohere Transcribe ASR before runtime UI launch: model={transcriber.config.model_id}",
+        flush=True,
+    )
+    try:
+        transcriber.prewarm(run_dummy_inference=_env_flag("BC_ASR_PREWARM_INFERENCE", default=True))
+    except Exception as error:
+        unload = getattr(transcriber, "unload", None)
+        if unload is not None:
+            unload()
+        _set_asr_runtime_status(
+            "failed",
+            "Cohere Transcribe ASR preload failed.",
+            error=error,
+        )
+        if _env_flag("BC_ASR_PREWARM_REQUIRED", default=False):
+            raise
+        print(f"Cohere Transcribe ASR prewarm failed; continuing runtime UI launch: {error}", flush=True)
+        return
+    elapsed = time.monotonic() - started
+    _set_asr_runtime_status("ready", f"Cohere Transcribe ASR ready in {elapsed:.1f}s.")
+    print(f"Cohere Transcribe ASR prewarm complete in {elapsed:.1f}s.", flush=True)
+
+
+def _prewarm_runtime_startup_if_enabled(mode: GradioMode | str) -> None:
+    if _resolve_gradio_mode(mode) != "runtime":
+        return
+    prewarmers = [_prewarm_runtime_llm_if_enabled, _prewarm_runtime_asr_if_enabled]
+    if not _env_flag("BC_RUNTIME_PREWARM_PARALLEL", default=True):
+        for prewarm in prewarmers:
+            prewarm(mode)
+        return
+    with ThreadPoolExecutor(max_workers=len(prewarmers)) as executor:
+        futures = [executor.submit(prewarm, mode) for prewarm in prewarmers]
+        for future in futures:
+            future.result()
 
 
 def _new_runtime_run_id() -> str:
@@ -971,6 +2094,10 @@ def _new_runtime_run_id() -> str:
 
 def _runtime_output_dir(run_id: str) -> Path:
     return RUNTIME_RUN_ROOT / run_id / "images"
+
+
+def _runtime_fast_parse_enabled() -> bool:
+    return _env_flag("BC_RUNTIME_FAST_PARSE", default=True)
 
 
 def _runtime_config_for_prompt(raw_prompt: str) -> AppConfig:
@@ -986,7 +2113,23 @@ def _runtime_config_for_prompt(raw_prompt: str) -> AppConfig:
             "stall_min_promoted": RUNTIME_STALL_MIN_PROMOTED,
         }
     )
-    return base.model_copy(update={"event_store_path": run_root / "events.jsonl", "run": run})
+    updates: dict[str, Any] = {"event_store_path": run_root / "events.jsonl", "run": run}
+    if _runtime_fast_parse_enabled() and not _env_flag("BC_RUNTIME_LLM_CANONICALIZER_FALLBACK", default=False):
+        updates["canonicalizer"] = base.canonicalizer.model_copy(update={"llm_fallback": False})
+    return base.model_copy(update=updates)
+
+
+def _build_runtime_prompt_pipeline(config: AppConfig) -> Any:
+    if not _runtime_fast_parse_enabled():
+        return build_prompt_pipeline(config)
+    return build_prompt_pipeline(
+        config,
+        extraction_validation_retries=_env_int("BC_RUNTIME_EXTRACTION_RETRIES", default=0),
+        max_repairs=_env_int("BC_RUNTIME_VERIFIER_REPAIRS", default=0),
+        max_semantic_repairs=_env_int("BC_RUNTIME_SEMANTIC_REPAIRS", default=0),
+        run_semantic_validation=_env_flag("BC_RUNTIME_SEMANTIC_VALIDATION", default=False),
+        run_verifier=_env_flag("BC_RUNTIME_VERIFIER", default=False),
+    )
 
 
 def _runtime_real_eval_default(config: AppConfig) -> bool:
@@ -1064,6 +2207,57 @@ def _runtime_generator_model_id(config: AppConfig) -> str:
     return f"{config.generator.kind}-generator"
 
 
+def _runtime_display_enum_value(value: str) -> str:
+    return value.lower().replace("_", " ")
+
+
+def _runtime_arm_prompt_phrase(field_path: str, value: str) -> str:
+    label = _runtime_display_enum_value(value)
+    if field_path == "cinematography.shot_size":
+        return label
+    if field_path == "cinematography.camera_angle":
+        return f"{label} camera angle"
+    if field_path == "cinematography.lens":
+        return f"{label} lens"
+    if field_path == "cinematography.lighting_mood":
+        return f"{label} lighting"
+    if field_path == "cinematography.color_treatment":
+        return f"{label} color treatment"
+    if field_path == "cinematography.composition":
+        return f"{label} composition"
+    if field_path.startswith("relation."):
+        return f"{label} relation"
+    return label
+
+
+def _runtime_sampled_arm_prompt_suffix(sampled_arms: dict[str, str]) -> str:
+    field_order = {
+        "cinematography.shot_size": 0,
+        "cinematography.camera_angle": 1,
+        "cinematography.lens": 2,
+        "cinematography.lighting_mood": 3,
+        "cinematography.color_treatment": 4,
+        "cinematography.composition": 5,
+    }
+    phrases = [
+        _runtime_arm_prompt_phrase(field_path, value)
+        for field_path, value in sorted(sampled_arms.items(), key=lambda item: (field_order.get(item[0], 99), item[0]))
+        if value
+    ]
+    return ", ".join(dict.fromkeys(phrases))
+
+
+def _runtime_prompt_with_sampled_arms(base_prompt: str, sampled_arms: dict[str, str]) -> str:
+    suffix = _runtime_sampled_arm_prompt_suffix(sampled_arms)
+    if not suffix:
+        return base_prompt
+    negative_marker = ". Negative prompt: "
+    if negative_marker in base_prompt:
+        positive, negative = base_prompt.split(negative_marker, 1)
+        return f"{positive.rstrip('.')}, {suffix}{negative_marker}{negative}"
+    return f"{base_prompt.rstrip('.')}, {suffix}."
+
+
 def _runtime_fixed_arms(lock_rows: Any) -> dict[str, AxisDomain]:
     fixed: dict[str, AxisDomain] = {}
     for row in _normal_lock_rows(lock_rows):
@@ -1071,7 +2265,7 @@ def _runtime_fixed_arms(lock_rows: Any) -> dict[str, AxisDomain]:
             continue
         field_path = str(row[1]).strip()
         raw_value = str(row[2]).strip()
-        enum_value = str(row[3]).strip()
+        enum_value = _clean_selected_enum_cell(row[3])
         value = enum_value or raw_value
         if not field_path or not value:
             continue
@@ -1083,17 +2277,42 @@ def _runtime_fixed_arms(lock_rows: Any) -> dict[str, AxisDomain]:
     return fixed
 
 
+def _runtime_sampleable_axes(lock_rows: Any, fixed_arms: dict[str, AxisDomain]) -> dict[str, list[ThompsonArmState]]:
+    axes: dict[str, list[ThompsonArmState]] = {}
+    for row in _normal_lock_rows(lock_rows):
+        if len(row) < 2:
+            continue
+        locked = bool(row[0])
+        field_path = str(row[1]).strip()
+        if locked or field_path in fixed_arms:
+            continue
+        domain_values = _enum_domain_values(field_path)
+        if not domain_values:
+            continue
+        arms: list[ThompsonArmState] = []
+        for index, value in enumerate(domain_values):
+            alpha, beta = _runtime_arm_prior(field_path, value, index=index)
+            arms.append(ThompsonArmState(axis=field_path, value=value, alpha=alpha, beta=beta))
+        axes[field_path] = sorted(
+            arms,
+            key=lambda arm: arm.alpha / (arm.alpha + arm.beta),
+            reverse=True,
+        )
+    return axes
+
+
 def _runtime_target_manifest(
     session: RuntimeUISession,
     *,
     coordinate_id: str | None = None,
+    rendered_prompt: str | None = None,
 ) -> EvaluationTargetManifest:
     return session.target_manifest.model_copy(
         update={
             "run_id": session.config.run.run_id,
             "prompt_document_id": session.document.prompt_document_id,
             "coordinate_id": coordinate_id,
-            "rendered_prompt": session.rendered_prompt.rendered_prompt,
+            "rendered_prompt": rendered_prompt or session.rendered_prompt.rendered_prompt,
         }
     )
 
@@ -1174,6 +2393,30 @@ def _persist_runtime_batch_summary(
     )
 
 
+def _persist_runtime_batch_prompt(session: RuntimeUISession, item: SeedSweepWorkItem, *, batch_index: int) -> None:
+    session.service.store.append(
+        PersistenceRecord(
+            record_id=f"runtime_batch_prompt:{item.coordinate_id}",
+            record_type="runtime_batch_prompt",
+            run_id=session.config.run.run_id,
+            prompt_document_id=session.document.prompt_document_id,
+            target_manifest_id=session.target_manifest.manifest_id,
+            coordinate_id=item.coordinate_id,
+            idempotency_key=f"runtime_batch_prompt:{item.coordinate_id}",
+            payload={
+                "batch_index": batch_index,
+                "coordinate_id": item.coordinate_id,
+                "rendered_prompt": item.rendered_prompt,
+                "sampled_arms": item.sampled_arms,
+                "locked_arms": item.locked_arms,
+                "lhs_row": item.lhs_row,
+                "combo_signature": item.combo_signature,
+                "persistence_version": PERSISTENCE_VERSION,
+            },
+        )
+    )
+
+
 def _runtime_work_item_for_batch(
     session: RuntimeUISession,
     *,
@@ -1182,21 +2425,36 @@ def _runtime_work_item_for_batch(
     evaluation_plan: EvaluationPlan,
     batch_index: int,
 ) -> SeedSweepWorkItem:
-    router_batch = LHSRouter(seed=7).propose(
+    sampleable_axes = _runtime_sampleable_axes(lock_rows, fixed_arms)
+    lhs_count = max((len(arms) for arms in sampleable_axes.values()), default=1)
+    cycle_index = (batch_index - 1) % lhs_count
+    cycle_seed = 7 + ((batch_index - 1) // lhs_count) * 7919
+    router_batch = LHSRouter(
+        seed=cycle_seed,
+        compatibility_prior=_runtime_compatibility_prior(),
+        compatibility_prior_weight=0.25,
+    ).propose(
         RouterInput(
             run_id=session.config.run.run_id,
             prompt_document_id=session.document.prompt_document_id,
             target_manifest_id=session.target_manifest.manifest_id,
             fixed_arms=fixed_arms,
-            sampleable_axes={},
-            count=1,
+            sampleable_axes=sampleable_axes,
+            count=lhs_count,
         )
     )
     if not router_batch.coordinates:
         raise gr.Error("Router rejected the locked coordinate configuration.")
     coordinate_id = f"coord_{batch_index:03d}"
-    coordinate = router_batch.coordinates[0].model_copy(update={"coordinate_id": coordinate_id})
-    target_manifest = _runtime_target_manifest(session, coordinate_id=coordinate.coordinate_id)
+    coordinate = router_batch.coordinates[cycle_index % len(router_batch.coordinates)].model_copy(
+        update={"coordinate_id": coordinate_id}
+    )
+    rendered_prompt = _runtime_prompt_with_sampled_arms(session.rendered_prompt.rendered_prompt, coordinate.sampled_arms)
+    target_manifest = _runtime_target_manifest(
+        session,
+        coordinate_id=coordinate.coordinate_id,
+        rendered_prompt=rendered_prompt,
+    )
     generation_settings = GenerationSettings(
         steps=int(os.environ.get("BC_GRADIO_GENERATION_STEPS", "4")),
         height=int(os.environ.get("BC_GRADIO_IMAGE_HEIGHT", "512")),
@@ -1208,7 +2466,7 @@ def _runtime_work_item_for_batch(
         prompt_document_id=session.document.prompt_document_id,
         target_manifest_id=target_manifest.manifest_id,
         coordinate_id=coordinate.coordinate_id,
-        rendered_prompt=session.rendered_prompt.rendered_prompt,
+        rendered_prompt=rendered_prompt,
         generation_settings=generation_settings,
         output_dir=session.output_dir,
         generator_model_id=_runtime_generator_model_id(session.config),
@@ -1221,7 +2479,7 @@ def _runtime_work_item_for_batch(
         raw_user_prompt=session.config.run.raw_user_prompt,
         prompt_document_version=session.document.prompt_document_version,
         coordinate_id=coordinate.coordinate_id,
-        rendered_prompt=session.rendered_prompt.rendered_prompt,
+        rendered_prompt=rendered_prompt,
         target_manifest=target_manifest.model_dump(mode="json"),
         generation_requests=requests,
         evaluation_plan=evaluation_plan,
@@ -1262,6 +2520,61 @@ def _runtime_progress_notification(records: list[PersistenceRecord], *, batch_in
         f"Batch {batch_index} complete: {counts.promoted_curated_count} curated, "
         f"{counts.generated_count} generated, elapsed {_format_runtime_elapsed(elapsed_seconds)}."
     )
+
+
+def _runtime_lhs_prompt_notification(*, batch_index: int, elapsed_seconds: int) -> str:
+    return f"Batch {batch_index} LHS prompt ready: 0/5 seeds displayed, elapsed {_format_runtime_elapsed(elapsed_seconds)}."
+
+
+def _runtime_generation_notification(
+    *,
+    batch_index: int,
+    rendered_count: int,
+    total_count: int,
+    elapsed_seconds: int,
+) -> str:
+    return (
+        f"Batch {batch_index} rendering: {rendered_count}/{total_count} seeds displayed, "
+        f"elapsed {_format_runtime_elapsed(elapsed_seconds)}."
+    )
+
+
+def _runtime_stream_poll_seconds() -> float:
+    return max(0.01, float(os.environ.get("BC_GRADIO_STREAM_POLL_SECONDS", str(RUNTIME_STREAM_POLL_SECONDS))))
+
+
+def _runtime_final_seed_refresh_seconds() -> float:
+    return max(
+        0.0,
+        float(os.environ.get("BC_GRADIO_FINAL_SEED_REFRESH_SECONDS", str(RUNTIME_FINAL_SEED_REFRESH_SECONDS))),
+    )
+
+
+def _runtime_coordinate_candidate_count(records: list[PersistenceRecord], coordinate_id: str) -> int:
+    return sum(
+        1
+        for record in records
+        if record.record_type == "candidate_record" and record.coordinate_id == coordinate_id
+    )
+
+
+def _runtime_coordinate_rendered_prompt(
+    records: list[PersistenceRecord],
+    *,
+    coordinate_id: str | None,
+    fallback: str,
+) -> str:
+    if coordinate_id is None:
+        return fallback
+    for record in reversed(records):
+        if record.coordinate_id != coordinate_id:
+            continue
+        if record.record_type not in {"runtime_batch_prompt", "coordinate_record", "target_manifest"}:
+            continue
+        rendered_prompt = str(record.payload.get("rendered_prompt") or "").strip()
+        if rendered_prompt:
+            return rendered_prompt
+    return fallback
 
 
 def _runtime_batch_notification(records: list[PersistenceRecord]) -> str:
@@ -1348,6 +2661,7 @@ def _runtime_state_from_store(
     *,
     current_coordinate_id: str | None = None,
     notification: str | None = None,
+    rendered_prompt: str | None = None,
 ) -> GradioSimulationState:
     records = session.service.store.replay()
     candidates = _runtime_candidates_from_records(records)
@@ -1361,7 +2675,7 @@ def _runtime_state_from_store(
     selected_id = state.selected_candidate_id
     visible_ids = {candidate.candidate_id for candidate in curated if candidate.feedback_state not in {"reject", "shred"}}
     if selected_id not in visible_ids:
-        selected_id = next(iter(visible_ids), None)
+        selected_id = None
 
     counts = None
     if records:
@@ -1373,7 +2687,12 @@ def _runtime_state_from_store(
     updates: dict[str, Any] = {
         "run_id": session.config.run.run_id,
         "raw_prompt": session.config.run.raw_user_prompt,
-        "rendered_prompt": session.rendered_prompt.rendered_prompt,
+        "rendered_prompt": rendered_prompt
+        or _runtime_coordinate_rendered_prompt(
+            records,
+            coordinate_id=current_coordinate_id,
+            fallback=state.rendered_prompt or session.rendered_prompt.rendered_prompt,
+        ),
         "prompt_document_id": session.document.prompt_document_id,
         "current_batch": current_batch,
         "curated": curated,
@@ -1392,7 +2711,51 @@ def _runtime_state_from_store(
                 "batch_index": max(state.batch_index, len(counts.coordinate_ids)),
             }
         )
-    return state.model_copy(update=updates)
+    return _clamp_catalog_page_state(state.model_copy(update=updates))
+
+
+def _runtime_state_from_session(
+    session: RuntimeUISession,
+    state: GradioSimulationState,
+    *,
+    notification: str | None = None,
+) -> GradioSimulationState:
+    review = pre_run_modal_from_prompt(session.document)
+    recovered = state.model_copy(
+        update={
+            "run_id": session.config.run.run_id,
+            "raw_prompt": session.config.run.raw_user_prompt,
+            "rendered_prompt": session.rendered_prompt.rendered_prompt,
+            "prompt_document_id": session.document.prompt_document_id,
+            "review": review,
+            "notification": notification or state.notification,
+        }
+    )
+    if session.service.store.path.exists():
+        return _runtime_state_from_store(session, recovered, notification=notification or recovered.notification)
+    return recovered
+
+
+def _recover_runtime_ready_state(
+    state: GradioSimulationState,
+    raw_prompt: str | None,
+) -> tuple[GradioSimulationState, RuntimeUISession | None]:
+    session = _RUNTIME_SESSIONS.get(state.run_id)
+    if session is not None:
+        recovered = _runtime_state_from_session(session, state)
+        return recovered, session
+
+    prompt = (raw_prompt or state.raw_prompt or "").strip()
+    if not prompt:
+        return state, None
+
+    recovered_state, *_ = start_pre_run_runtime(prompt, state)
+    recovered = _coerce_state(recovered_state)
+    return recovered, _RUNTIME_SESSIONS.get(recovered.run_id)
+
+
+def _runtime_generation_started(state: GradioSimulationState) -> bool:
+    return state.batch_index > 0 or state.generated_count > 0 or bool(state.current_batch_expected_seeds)
 
 
 def _selected_candidate(state: GradioSimulationState) -> SimCandidate | None:
@@ -1414,6 +2777,11 @@ def start_pre_run(raw_prompt: str, state_value: GradioSimulationState | dict[str
             "raw_prompt": raw_prompt.strip(),
             "rendered_prompt": rendered,
             "review": review,
+            "current_batch": [],
+            "current_batch_expected_seeds": [],
+            "curated": [],
+            "catalog_page_index": 0,
+            "selected_candidate_id": None,
             "notification": _prompt_blocked_notification(
                 review,
                 ready_message="Pre-run parse ready.",
@@ -1444,10 +2812,48 @@ def start_pre_run_runtime(raw_prompt: str, state_value: GradioSimulationState | 
 
     try:
         config = _runtime_config_for_prompt(prompt)
-        pipeline = build_prompt_pipeline(config)
-        result = pipeline.run_spec(prompt)
+        pipeline = _build_runtime_prompt_pipeline(config)
     except Exception as error:
         raise gr.Error(f"Backend pre-run startup failed: {error}") from error
+
+    try:
+        result = pipeline.run_spec(prompt)
+    except Exception as error:
+        document = _runtime_parse_failed_document(prompt, error)
+        review = pre_run_modal_from_prompt(document)
+        state = state.model_copy(
+            update={
+                "run_id": config.run.run_id,
+                "raw_prompt": prompt,
+                "rendered_prompt": "",
+                "prompt_document_id": document.prompt_document_id,
+                "batch_index": 0,
+                "review": review,
+                "current_batch": [],
+                "current_batch_expected_seeds": [],
+                "curated": [],
+                "selected_candidate_id": None,
+                "generated_count": 0,
+                "iqa_evaluated_count": 0,
+                "vlm_evaluated_count": 0,
+                "accepted_count": 0,
+                "rejected_count": 0,
+                "shredded_count": 0,
+                "notification": _prompt_blocked_notification(
+                    review,
+                    ready_message="Backend pre-run ready.",
+                    parseable_prompt=_parseable_prompt_suggestion_for_block(prompt, document, review),
+                ),
+            }
+        )
+        return (
+            state,
+            gr.update(visible=True),
+            _review_markdown(prompt, document, review, ""),
+            _lock_table_from_review(review),
+            gr.update(interactive=False),
+            _status_html(state),
+        )
 
     document = result.document.model_copy(update={"raw_user_prompt": prompt})
     review = pre_run_modal_from_prompt(document)
@@ -1475,6 +2881,12 @@ def start_pre_run_runtime(raw_prompt: str, state_value: GradioSimulationState | 
                     "target_manifest_id": target_manifest.manifest_id,
                 }
             )
+            if _asr_release_before_runtime_service_enabled():
+                _unload_runtime_asr("runtime pre-run service build")
+            _release_inactive_runtime_sessions(
+                keep_run_id=config.run.run_id,
+                reason="gradio_runtime_replaced_by_new_prompt",
+            )
             service = _build_runtime_service(config)
             session = RuntimeUISession(
                 config=config,
@@ -1498,7 +2910,9 @@ def start_pre_run_runtime(raw_prompt: str, state_value: GradioSimulationState | 
             "batch_index": 0,
             "review": review,
             "current_batch": [],
+            "current_batch_expected_seeds": [],
             "curated": [],
+            "catalog_page_index": 0,
             "selected_candidate_id": None,
             "generated_count": 0,
             "iqa_evaluated_count": 0,
@@ -1525,9 +2939,22 @@ def start_pre_run_runtime(raw_prompt: str, state_value: GradioSimulationState | 
 
 def cancel_pre_run_runtime(state_value: GradioSimulationState | dict[str, Any] | None):
     state = _coerce_state(state_value)
+    session = _RUNTIME_SESSIONS.get(state.run_id)
+    if session is not None and _runtime_generation_started(state):
+        session.service.request_stop()
+        state = state.model_copy(
+            update={
+                "notification": "Stop requested. Finishing the current 5-seed batch before stopping.",
+            }
+        )
+        return state, gr.update(), gr.update(interactive=False), _status_html(state)
+
     session = _RUNTIME_SESSIONS.pop(state.run_id, None)
     if session is not None:
-        session.service.request_pause()
+        session.service.stop_with_reason(
+            "pre_run_cancel_requested",
+            details={"run_id": session.config.run.run_id},
+        )
     state = state.model_copy(update={"notification": "Backend pre-run canceled."})
     return state, gr.update(visible=False), gr.update(interactive=False), _status_html(state)
 
@@ -1537,40 +2964,44 @@ def generate_seed_sweep(
     lock_rows: Any,
     iqa_cutoff: float,
     alignment_cutoff: float,
+    raw_prompt: str | None = None,
 ):
     state = _coerce_state(state_value)
     if state.review is None or not state.review.can_begin_generation:
-        raise gr.Error("Pre-run review is not ready.")
+        raise gr.Error("Pre-run review is not ready. Submit the prompt, wait for pre-run review, then click Generate.")
     pending = _make_pending_batch(state, lock_rows)
     generated_state = state.model_copy(
         update={
             "current_batch": pending,
+            "current_batch_expected_seeds": [candidate.seed for candidate in pending],
             "batch_index": state.batch_index + 1,
             "generated_count": state.generated_count + len(pending),
             "notification": "5-seed preview generated.",
         }
     )
-    selected = _selected_candidate(generated_state)
     yield (
         generated_state,
-        gr.update(visible=False),
         gr.update(visible=True),
-        _preview_gallery(pending),
+        gr.update(),
+        gr.update(visible=True),
+        *_preview_slot_paths(generated_state),
         _catalog_gallery(generated_state),
-        gr.update(visible=selected is not None),
-        selected.display_path if selected else None,
-        _detail_markdown(generated_state, selected),
+        *_catalog_slot_paths(generated_state),
+        *_catalog_page_controls(generated_state),
+        gr.update(visible=True),
+        gr.update(visible=False),
+        gr.update(visible=False),
         _status_html(generated_state),
     )
     time.sleep(0.6)
     evaluated = _evaluate_batch(state, pending, iqa_cutoff=iqa_cutoff, alignment_cutoff=alignment_cutoff)
     promoted = [candidate for candidate in evaluated if candidate.promoted]
-    selected_id = state.selected_candidate_id
-    if selected_id is None and promoted:
-        selected_id = promoted[0].candidate_id
+    visible_ids = {candidate.candidate_id for candidate in [*state.curated, *promoted]}
+    selected_id = state.selected_candidate_id if state.selected_candidate_id in visible_ids else None
     evaluated_state = generated_state.model_copy(
         update={
             "current_batch": evaluated,
+            "current_batch_expected_seeds": [candidate.seed for candidate in evaluated],
             "curated": [*state.curated, *promoted],
             "selected_candidate_id": selected_id,
             "iqa_evaluated_count": state.iqa_evaluated_count + len(evaluated),
@@ -1578,16 +3009,18 @@ def generate_seed_sweep(
             "notification": f"Evaluation complete: {len(promoted)} promoted.",
         }
     )
-    selected = _selected_candidate(evaluated_state)
     yield (
         evaluated_state,
-        gr.update(visible=False),
         gr.update(visible=True),
-        _preview_gallery(evaluated),
+        gr.update(),
+        gr.update(visible=True),
+        *_preview_slot_paths(evaluated_state),
         _catalog_gallery(evaluated_state),
-        gr.update(visible=selected is not None),
-        selected.display_path if selected else None,
-        _detail_markdown(evaluated_state, selected),
+        *_catalog_slot_paths(evaluated_state),
+        *_catalog_page_controls(evaluated_state),
+        gr.update(visible=True),
+        gr.update(visible=False),
+        gr.update(visible=False),
         _status_html(evaluated_state),
     )
 
@@ -1597,30 +3030,47 @@ def generate_seed_sweep_runtime(
     lock_rows: Any,
     iqa_cutoff: float,
     alignment_cutoff: float,
+    raw_prompt: str | None = None,
 ):
     state = _coerce_state(state_value)
+    session = _RUNTIME_SESSIONS.get(state.run_id)
+    if state.review is None or not state.review.can_begin_generation or session is None:
+        state, session = _recover_runtime_ready_state(state, raw_prompt)
     if state.review is None or not state.review.can_begin_generation:
-        raise gr.Error("Pre-run review is not ready.")
+        raise gr.Error(
+            "Pre-run review is not ready. Submit the prompt, wait for Backend pre-run ready, then click Generate."
+        )
     session = _RUNTIME_SESSIONS.get(state.run_id)
     if session is None:
-        raise gr.Error("Runtime backend session is missing. Submit the prompt again to rebuild it.")
+        raise gr.Error("Runtime backend session expired. Submit the prompt again to rebuild it, then click Generate.")
+
+    def output_for(
+        next_state: GradioSimulationState,
+        review_markup: str | None = None,
+        *,
+        clear_catalog: bool = False,
+    ):
+        return (
+            next_state,
+            gr.update(visible=True),
+            review_markup if review_markup is not None else _runtime_review_markup(session, next_state),
+            gr.update(visible=True),
+            *_preview_slot_paths(next_state),
+            _catalog_gallery_update(next_state, clear=clear_catalog),
+            *_catalog_slot_paths(next_state, clear=clear_catalog),
+            *_catalog_page_controls(next_state),
+            gr.update(visible=True),
+            gr.update(visible=False),
+            gr.update(visible=False),
+            _status_html(next_state),
+        )
 
     active_state = state.model_copy(
         update={
             "notification": "Backend run started.",
         }
     )
-    yield (
-        active_state,
-        gr.update(visible=False),
-        gr.update(visible=True),
-        [],
-        _catalog_gallery(active_state),
-        gr.update(visible=False),
-        None,
-        "",
-        _status_html(active_state),
-    )
+    yield output_for(active_state)
 
     loop_started_at = time.monotonic()
     fixed_arms = _runtime_fixed_arms(lock_rows)
@@ -1632,6 +3082,23 @@ def generate_seed_sweep_runtime(
     working_state = active_state
     while True:
         elapsed_seconds = int(time.monotonic() - loop_started_at)
+        if session.service.stop_requested:
+            if session.service.state != RunRuntimeState.STOPPED:
+                session.service.stop_with_reason(
+                    "gradio_runtime_cancel_requested",
+                    details={
+                        "elapsed_seconds": elapsed_seconds,
+                        "run_id": session.config.run.run_id,
+                    },
+                )
+            stopped_state = _runtime_state_from_store(
+                session,
+                working_state,
+                notification="Stopped by backend/requested stop.",
+            )
+            yield output_for(stopped_state)
+            return
+
         if elapsed_seconds >= RUNTIME_LOOP_LIMIT_SECONDS:
             session.service.stop_with_reason(
                 "gradio_runtime_time_limit",
@@ -1646,18 +3113,7 @@ def generate_seed_sweep_runtime(
                 working_state,
                 notification="Stopped at 15-minute time limit.",
             )
-            selected = _selected_candidate(stopped_state)
-            yield (
-                stopped_state,
-                gr.update(visible=False),
-                gr.update(visible=True),
-                _preview_gallery(stopped_state.current_batch),
-                _catalog_gallery(stopped_state),
-                gr.update(visible=selected is not None),
-                selected.display_path if selected else None,
-                _detail_markdown(stopped_state, selected),
-                _status_html(stopped_state),
-            )
+            yield output_for(stopped_state)
             return
 
         batch_index = working_state.batch_index + 1
@@ -1668,9 +3124,93 @@ def generate_seed_sweep_runtime(
             evaluation_plan=evaluation_plan,
             batch_index=batch_index,
         )
+        working_state = working_state.model_copy(
+            update={
+                "current_batch": [],
+                "current_batch_expected_seeds": [request.seed for request in item.generation_requests],
+                "batch_index": batch_index,
+                "rendered_prompt": item.rendered_prompt,
+                "notification": _runtime_lhs_prompt_notification(
+                    batch_index=batch_index,
+                    elapsed_seconds=elapsed_seconds,
+                ),
+            }
+        )
+        _persist_runtime_batch_prompt(session, item, batch_index=batch_index)
+        yield output_for(working_state, _runtime_review_markup(session, working_state, item=item, batch_index=batch_index))
         session.service.enqueue(item)
-        decision = session.service.tick()
+        last_rendered_count = 0
+        last_catalog_signature = _catalog_gallery_signature(working_state)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(session.service.tick)
+            while not future.done():
+                elapsed_seconds = int(time.monotonic() - loop_started_at)
+                records = session.service.store.replay()
+                rendered_count = _runtime_coordinate_candidate_count(records, item.coordinate_id)
+                catalog_signature = _runtime_catalog_signature_from_records(records)
+                catalog_changed = catalog_signature != last_catalog_signature
+                if rendered_count != last_rendered_count or catalog_changed:
+                    last_rendered_count = rendered_count
+                    streaming_state = _runtime_state_from_store(
+                        session,
+                        working_state,
+                        current_coordinate_id=item.coordinate_id,
+                        notification=_runtime_generation_notification(
+                            batch_index=batch_index,
+                            rendered_count=rendered_count,
+                            total_count=len(item.generation_requests),
+                            elapsed_seconds=elapsed_seconds,
+                        ),
+                        rendered_prompt=item.rendered_prompt,
+                    )
+                    if catalog_changed:
+                        yield output_for(
+                            streaming_state,
+                            _runtime_review_markup(session, streaming_state, item=item, batch_index=batch_index),
+                            clear_catalog=True,
+                        )
+                        time.sleep(0.05)
+                    yield output_for(
+                        streaming_state,
+                        _runtime_review_markup(session, streaming_state, item=item, batch_index=batch_index),
+                    )
+                    working_state = streaming_state
+                    last_catalog_signature = _catalog_gallery_signature(streaming_state)
+                time.sleep(_runtime_stream_poll_seconds())
+            decision = future.result()
         elapsed_seconds = int(time.monotonic() - loop_started_at)
+        records = session.service.store.replay()
+        rendered_count = _runtime_coordinate_candidate_count(records, item.coordinate_id)
+        catalog_signature = _runtime_catalog_signature_from_records(records)
+        catalog_changed = catalog_signature != last_catalog_signature
+        if rendered_count != last_rendered_count or catalog_changed:
+            streaming_state = _runtime_state_from_store(
+                session,
+                working_state,
+                current_coordinate_id=item.coordinate_id,
+                notification=_runtime_generation_notification(
+                    batch_index=batch_index,
+                    rendered_count=rendered_count,
+                    total_count=len(item.generation_requests),
+                    elapsed_seconds=elapsed_seconds,
+                ),
+                rendered_prompt=item.rendered_prompt,
+            )
+            if catalog_changed:
+                yield output_for(
+                    streaming_state,
+                    _runtime_review_markup(session, streaming_state, item=item, batch_index=batch_index),
+                    clear_catalog=True,
+                )
+                time.sleep(0.05)
+            yield output_for(
+                streaming_state,
+                _runtime_review_markup(session, streaming_state, item=item, batch_index=batch_index),
+            )
+            working_state = streaming_state
+            last_catalog_signature = _catalog_gallery_signature(streaming_state)
+            if rendered_count >= len(item.generation_requests):
+                time.sleep(_runtime_final_seed_refresh_seconds())
 
         if decision.next_state == RunRuntimeState.STOPPED and decision.reason != "pending_coordinates":
             stopped_state = _runtime_state_from_store(
@@ -1679,18 +3219,25 @@ def generate_seed_sweep_runtime(
                 current_coordinate_id=item.coordinate_id,
                 notification="Stopped by backend/requested stop.",
             )
-            selected = _selected_candidate(stopped_state)
-            yield (
-                stopped_state,
-                gr.update(visible=False),
-                gr.update(visible=True),
-                _preview_gallery(stopped_state.current_batch),
-                _catalog_gallery(stopped_state),
-                gr.update(visible=selected is not None),
-                selected.display_path if selected else None,
-                _detail_markdown(stopped_state, selected),
-                _status_html(stopped_state),
+            yield output_for(stopped_state)
+            return
+
+        if decision.action == LoopAction.GATE_BLOCKED:
+            session.service.stop_with_reason(
+                "backend_gate_blocked",
+                details={
+                    "reason": decision.reason,
+                    "coordinate_id": item.coordinate_id,
+                    "batch_index": batch_index,
+                },
             )
+            stopped_state = _runtime_state_from_store(
+                session,
+                working_state,
+                current_coordinate_id=item.coordinate_id,
+                notification=f"Stopped by backend gate: {decision.reason}",
+            )
+            yield output_for(stopped_state)
             return
 
         _persist_runtime_batch_summary(
@@ -1712,7 +3259,24 @@ def generate_seed_sweep_runtime(
             notification=notification,
         )
 
-        if elapsed_seconds >= RUNTIME_LOOP_LIMIT_SECONDS:
+        if session.service.stop_requested:
+            if session.service.state != RunRuntimeState.STOPPED:
+                session.service.stop_with_reason(
+                    "gradio_runtime_cancel_requested",
+                    details={
+                        "elapsed_seconds": elapsed_seconds,
+                        "run_id": session.config.run.run_id,
+                        "coordinate_id": item.coordinate_id,
+                        "batch_index": batch_index,
+                    },
+                )
+            next_state = _runtime_state_from_store(
+                session,
+                next_state,
+                current_coordinate_id=item.coordinate_id,
+                notification="Stopped by backend/requested stop.",
+            )
+        elif elapsed_seconds >= RUNTIME_LOOP_LIMIT_SECONDS:
             session.service.stop_with_reason(
                 "gradio_runtime_time_limit",
                 details={
@@ -1744,37 +3308,50 @@ def generate_seed_sweep_runtime(
                     notification="Stopped by backend/requested stop.",
                 )
 
-        selected = _selected_candidate(next_state)
-        yield (
-            next_state,
-            gr.update(visible=False),
-            gr.update(visible=True),
-            _preview_gallery(next_state.current_batch),
-            _catalog_gallery(next_state),
-            gr.update(visible=selected is not None),
-            selected.display_path if selected else None,
-            _detail_markdown(next_state, selected),
-            _status_html(next_state),
-        )
+        yield output_for(next_state)
         if session.service.state == RunRuntimeState.STOPPED:
             return
         working_state = next_state
 
 
-def select_curated(evt: gr.SelectData, state_value: GradioSimulationState | dict[str, Any] | None):
+def select_curated_index(index: int, state_value: GradioSimulationState | dict[str, Any] | None):
     state = _coerce_state(state_value)
-    index = evt.index[0] if isinstance(evt.index, tuple) else evt.index
     visible = _visible_catalog(state)
-    if not isinstance(index, int) or index < 0 or index >= len(visible):
-        return state, gr.update(visible=False), None, "", _status_html(state)
-    candidate = visible[index]
+    page_start, _page_end = _catalog_page_window(state)
+    absolute_index = page_start + index
+    if not isinstance(index, int) or index < 0 or absolute_index >= len(visible):
+        return state, gr.update(visible=False), _detail_image_update(None), "", _status_html(state)
+    candidate = visible[absolute_index]
     state = state.model_copy(
         update={
             "selected_candidate_id": candidate.candidate_id,
             "notification": f"Selected seed {candidate.seed}.",
         }
     )
-    return state, gr.update(visible=True), candidate.display_path, _detail_markdown(state, candidate), _status_html(state)
+    return state, gr.update(visible=True), _detail_image_update(candidate), _detail_markdown(state, candidate), _status_html(state)
+
+
+def select_curated(evt: gr.SelectData, state_value: GradioSimulationState | dict[str, Any] | None):
+    index = evt.index[0] if isinstance(evt.index, tuple) else evt.index
+    return select_curated_index(index, state_value)
+
+
+def move_catalog_page(state_value: GradioSimulationState | dict[str, Any] | None, delta: int):
+    state = _coerce_state(state_value)
+    page_count = _catalog_page_count(state)
+    next_index = min(max(state.catalog_page_index + delta, 0), page_count - 1)
+    state = state.model_copy(
+        update={
+            "catalog_page_index": next_index,
+            "notification": f"Curated catalog page {next_index + 1} of {page_count}.",
+        }
+    )
+    return (
+        state,
+        *_catalog_slot_paths(state),
+        *_catalog_page_controls(state),
+        _status_html(state),
+    )
 
 
 def move_selection(state_value: GradioSimulationState | dict[str, Any] | None, delta: int):
@@ -1794,7 +3371,7 @@ def move_selection(state_value: GradioSimulationState | dict[str, Any] | None, d
             "notification": f"Selected seed {candidate.seed}.",
         }
     )
-    return state, gr.update(visible=True), candidate.display_path, _detail_markdown(state, candidate), _status_html(state)
+    return state, gr.update(visible=True), _detail_image_update(candidate), _detail_markdown(state, candidate), _status_html(state)
 
 
 def submit_feedback(
@@ -1804,7 +3381,7 @@ def submit_feedback(
     state = _coerce_state(state_value)
     selected = _selected_candidate(state)
     if selected is None:
-        return state, _catalog_gallery(state), gr.update(visible=False), None, "", _status_html(state)
+        return state, _catalog_gallery(state), gr.update(visible=False), _detail_image_update(None), "", _status_html(state)
     action = FeedbackAction(action_value)
     submit_feedback_event(run_id=state.run_id, candidate_id=selected.candidate_id, action=action)
     updated_curated = [
@@ -1823,16 +3400,13 @@ def submit_feedback(
         }
     )
     if action in {FeedbackAction.REJECT, FeedbackAction.SHRED}:
-        visible = _visible_catalog(next_state)
-        next_state = next_state.model_copy(
-            update={"selected_candidate_id": visible[0].candidate_id if visible else None}
-        )
+        next_state = next_state.model_copy(update={"selected_candidate_id": None})
     selected_after = _selected_candidate(next_state)
     return (
         next_state,
         _catalog_gallery(next_state),
         gr.update(visible=selected_after is not None),
-        selected_after.display_path if selected_after else None,
+        _detail_image_update(selected_after),
         _detail_markdown(next_state, selected_after),
         _status_html(next_state),
     )
@@ -1845,7 +3419,7 @@ def submit_feedback_runtime(
     state = _coerce_state(state_value)
     selected = _selected_candidate(state)
     if selected is None:
-        return state, _catalog_gallery(state), gr.update(visible=False), None, "", _status_html(state)
+        return state, _catalog_gallery(state), gr.update(visible=False), _detail_image_update(None), "", _status_html(state)
     session = _RUNTIME_SESSIONS.get(state.run_id)
     if session is None:
         raise gr.Error("Runtime backend session is missing. Submit the prompt again to rebuild it.")
@@ -1861,14 +3435,35 @@ def submit_feedback_runtime(
         state,
         notification=f"Feedback recorded: {action.value}.",
     )
+    if action in {FeedbackAction.REJECT, FeedbackAction.SHRED}:
+        next_state = next_state.model_copy(update={"selected_candidate_id": None})
     selected_after = _selected_candidate(next_state)
     return (
         next_state,
         _catalog_gallery(next_state),
         gr.update(visible=selected_after is not None),
-        selected_after.display_path if selected_after else None,
+        _detail_image_update(selected_after),
         _detail_markdown(next_state, selected_after),
         _status_html(next_state),
+    )
+
+
+def submit_feedback_with_catalog_slots(
+    handler: Any,
+    state_value: GradioSimulationState | dict[str, Any] | None,
+    action_value: str,
+):
+    next_state, gallery, detail_panel_update, detail_image, detail_report, status = handler(state_value, action_value)
+    state = _clamp_catalog_page_state(_coerce_state(next_state))
+    return (
+        state,
+        gallery,
+        *_catalog_slot_paths(state),
+        *_catalog_page_controls(state),
+        detail_panel_update,
+        detail_image,
+        detail_report,
+        status,
     )
 
 
@@ -1880,16 +3475,32 @@ def transcribe_microphone_to_prompt(
     state = _coerce_state(state_value)
     if audio is None:
         return current_prompt, state, _status_html(state)
+    blocked_message = _asr_transcription_block_message()
+    if blocked_message is not None:
+        state = state.model_copy(update={"notification": blocked_message})
+        return current_prompt, state, _status_html(state)
+    _set_asr_runtime_status("loading", "Cohere Transcribe ASR is transcribing microphone audio.")
+    transcriber = default_transcriber()
     try:
-        transcript = default_transcriber().transcribe(audio)
+        transcript = transcriber.transcribe(audio)
     except Exception as error:
+        unload = getattr(transcriber, "unload", None)
+        if unload is not None:
+            unload()
+        _set_asr_runtime_status("failed", "Cohere Transcribe ASR transcription failed.", error=error)
         state = state.model_copy(update={"notification": f"ASR failed: {error}"})
         return current_prompt, state, _status_html(state)
+    _set_asr_runtime_status("ready", "Cohere Transcribe ASR transcribed microphone audio.")
     prompt = transcript.strip()
+    release_after_transcribe = _asr_release_after_transcribe_enabled()
     if not prompt:
         state = state.model_copy(update={"notification": "ASR returned an empty transcript."})
         return current_prompt, state, _status_html(state)
-    state = state.model_copy(update={"raw_prompt": prompt, "notification": "ASR transcript inserted."})
+    notification = "ASR transcript inserted."
+    if release_after_transcribe:
+        _unload_runtime_asr("microphone transcription")
+        notification = "ASR transcript inserted; ASR released by low-VRAM policy."
+    state = state.model_copy(update={"raw_prompt": prompt, "notification": notification})
     return prompt, state, _status_html(state)
 
 
@@ -1901,6 +3512,11 @@ def transcribe_microphone_to_prompt_steps(
     state = _coerce_state(state_value)
     if audio is None:
         yield gr.update(value=current_prompt, interactive=True), state, _status_html(state)
+        return
+    blocked_message = _asr_transcription_block_message()
+    if blocked_message is not None:
+        blocked_state = state.model_copy(update={"notification": blocked_message})
+        yield gr.update(value=current_prompt, interactive=True), blocked_state, _status_html(blocked_state)
         return
     processing_state = state.model_copy(update={"notification": "Transcribing microphone audio."})
     yield gr.update(value="Transcribing audio...", interactive=False), processing_state, _status_html(processing_state)
@@ -1980,14 +3596,14 @@ CSS = """
     min-height: 100%;
     overflow: auto;
 }
-#workflow-mermaid,
+#workflow-diagram,
 #workflow-explanation {
     color: var(--bc-ink) !important;
 }
 #workflow-explanation,
 #workflow-explanation *,
-#workflow-mermaid,
-#workflow-mermaid * {
+#workflow-diagram,
+#workflow-diagram * {
     opacity: 1 !important;
 }
 #workflow-explanation p,
@@ -1995,40 +3611,105 @@ CSS = """
 #workflow-explanation span {
     color: var(--bc-ink) !important;
 }
-#workflow-mermaid pre {
-    background: #fbfdfc !important;
-    border: 1px solid #d9e2de !important;
-    border-radius: 8px !important;
+#workflow-diagram {
+    overflow-x: auto;
 }
-#workflow-mermaid svg text,
-#workflow-mermaid svg tspan,
-#workflow-mermaid svg foreignObject,
-#workflow-mermaid svg foreignObject div,
-#workflow-mermaid svg foreignObject span,
-#workflow-mermaid svg foreignObject p,
-#workflow-mermaid .nodeLabel,
-#workflow-mermaid .nodeLabel p,
-#workflow-mermaid .edgeLabel,
-#workflow-mermaid .label {
-    color: var(--bc-ink) !important;
-    fill: var(--bc-ink) !important;
-    -webkit-text-fill-color: var(--bc-ink) !important;
-    font-size: 14px !important;
+.bc-flow {
+    display: block;
+    color: var(--bc-ink);
+    overflow-wrap: anywhere;
 }
-#workflow-mermaid svg foreignObject,
-#workflow-mermaid svg foreignObject div,
-#workflow-mermaid svg foreignObject p,
-#workflow-mermaid .label {
-    overflow: visible !important;
+.bc-flow-svg,
+.bc-flow-svg-mobile {
+    display: block;
+    width: 100%;
+    height: auto;
+    color: var(--bc-ink);
 }
-#workflow-mermaid .node rect,
-#workflow-mermaid .node polygon,
-#workflow-mermaid .node path {
-    fill: #eef8f6 !important;
-    stroke: #0f766e !important;
+.bc-flow-svg {
+    min-width: 760px;
 }
-#workflow-mermaid .edgePath path {
-    stroke: var(--bc-ink) !important;
+.bc-flow-svg-mobile {
+    display: none;
+    min-width: 0;
+}
+.bc-flow-svg text,
+.bc-flow-svg-mobile text {
+    font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+    letter-spacing: 0;
+    fill: var(--bc-ink);
+}
+.bc-flow-node rect,
+.bc-flow-gate polygon {
+    filter: url(#bc-flow-shadow);
+    stroke-width: 1.5;
+}
+.bc-flow-svg-mobile .bc-flow-node rect,
+.bc-flow-svg-mobile .bc-flow-gate polygon {
+    filter: url(#bc-flow-shadow-mobile);
+}
+.bc-flow-node rect {
+    fill: #eef8f6;
+    stroke: #0f766e;
+}
+.bc-flow-gate polygon {
+    fill: #fff8e6;
+    stroke: #a16207;
+}
+.bc-flow-kicker {
+    color: var(--bc-teal-dark);
+    fill: var(--bc-teal-dark);
+    font-size: 11px;
+    font-weight: 820;
+    text-transform: uppercase;
+}
+.bc-flow-gate .bc-flow-kicker {
+    fill: #6f4400;
+}
+.bc-flow-label {
+    font-size: 13px;
+}
+.bc-flow-gate-label {
+    font-size: 13px;
+}
+.bc-flow-title {
+    fill: var(--bc-ink);
+    font-size: 16px;
+    font-weight: 780;
+}
+.bc-flow-label tspan:not(.bc-flow-kicker):not(.bc-flow-title),
+.bc-flow-gate-label tspan:not(.bc-flow-kicker):not(.bc-flow-title) {
+    fill: #30433d;
+    font-size: 12px;
+    font-weight: 500;
+}
+.bc-flow-edge {
+    fill: none;
+    stroke: #17211f;
+    stroke-width: 2.1;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+}
+#bc-flow-arrow path {
+    fill: #17211f;
+}
+#bc-flow-arrow-mobile path {
+    fill: #17211f;
+}
+.bc-flow-edge-loop {
+    stroke: #0f766e;
+    stroke-dasharray: 7 6;
+}
+#bc-flow-arrow-loop path {
+    fill: #0f766e;
+}
+#bc-flow-arrow-loop-mobile path {
+    fill: #0f766e;
+}
+.bc-flow-edge-label {
+    fill: #0f3d36;
+    font-size: 12px;
+    font-weight: 720;
 }
 #workflow-explanation h3 {
     margin: 0 0 10px;
@@ -2118,7 +3799,7 @@ CSS = """
     width: var(--bc-recorder-width) !important;
     min-width: var(--bc-recorder-width) !important;
     max-width: var(--bc-recorder-width) !important;
-    aspect-ratio: 4 / 3;
+    aspect-ratio: 3 / 4;
     align-self: stretch;
     overflow: hidden !important;
 }
@@ -2172,13 +3853,13 @@ CSS = """
 #prompt-microphone .audio-container {
     min-height: 100% !important;
     height: 100% !important;
-    aspect-ratio: 4 / 3;
+    aspect-ratio: 3 / 4;
     overflow: hidden !important;
 }
 #prompt-microphone .wrap {
     min-height: 100%;
     height: 100%;
-    aspect-ratio: 4 / 3;
+    aspect-ratio: 3 / 4;
     border: 1px solid var(--bc-line) !important;
     border-radius: 6px !important;
     box-shadow: none !important;
@@ -2315,6 +3996,106 @@ CSS = """
 }
 #detail-panel {
     border-left: 5px solid var(--bc-green);
+    background: #ffffff !important;
+    color: var(--bc-ink) !important;
+}
+#seed-slot-row {
+    display: grid !important;
+    grid-template-columns: repeat(5, minmax(120px, 1fr));
+    gap: 12px;
+}
+#seed-slot-row .bc-seed-slot {
+    min-width: 0 !important;
+    border: 1px solid var(--bc-line) !important;
+    border-radius: 8px !important;
+    background: #f8faf9 !important;
+    overflow: hidden !important;
+}
+#seed-slot-row .bc-seed-slot img {
+    width: 100% !important;
+    aspect-ratio: 3 / 4;
+    object-fit: cover !important;
+    border-radius: 6px;
+    background: #17211f !important;
+    transition: opacity 180ms ease, filter 180ms ease, transform 180ms ease;
+}
+#seed-slot-row .bc-seed-slot img:hover {
+    transform: scale(1.01);
+}
+#catalog-slot-panel {
+    border: 1px solid var(--bc-line);
+    border-radius: 8px;
+    padding: 12px;
+    background: #ffffff;
+}
+#catalog-slot-title .prose,
+#catalog-slot-title .prose p {
+    margin: 0 0 10px !important;
+    color: var(--bc-ink) !important;
+    font-weight: 780 !important;
+}
+#catalog-pagination {
+    display: grid !important;
+    grid-template-columns: minmax(110px, auto) minmax(180px, 1fr) minmax(110px, auto);
+    gap: 10px;
+    align-items: center;
+    margin: 0 0 12px !important;
+}
+#catalog-pagination button {
+    border: 1px solid #5f6f68 !important;
+    border-radius: 6px !important;
+    background: #ffffff !important;
+    color: #0f3d36 !important;
+    font-weight: 760 !important;
+    min-height: 34px !important;
+}
+#catalog-pagination button:disabled {
+    opacity: 0.55 !important;
+    color: #475569 !important;
+    background: #f1f5f3 !important;
+}
+#catalog-page-status,
+#catalog-page-status .prose,
+#catalog-page-status .prose p {
+    margin: 0 !important;
+    color: var(--bc-ink) !important;
+    font-weight: 760 !important;
+    text-align: center;
+}
+#catalog-slot-row {
+    display: grid !important;
+    grid-template-columns: repeat(4, minmax(120px, 1fr));
+    gap: 12px;
+}
+#catalog-slot-row .bc-catalog-slot {
+    min-width: 0 !important;
+    border: 1px solid var(--bc-line) !important;
+    border-radius: 8px !important;
+    background: #f8faf9 !important;
+    overflow: hidden !important;
+}
+#catalog-slot-row .bc-catalog-slot img {
+    display: block !important;
+    width: 100% !important;
+    aspect-ratio: 1 / 1;
+    object-fit: cover !important;
+    border-radius: 6px;
+    background: #17211f !important;
+    transition: opacity 180ms ease, filter 180ms ease, transform 180ms ease;
+}
+#catalog-slot-row .bc-catalog-slot img:hover {
+    transform: scale(1.01);
+}
+#lock-table table tbody tr td:nth-child(4),
+#lock-table table thead tr th:nth-child(4) {
+    background: #ecfdf5 !important;
+    color: #065f46 !important;
+    font-weight: 700 !important;
+}
+#lock-table table tbody tr td:nth-child(5),
+#lock-table table thead tr th:nth-child(5) {
+    background: #fff8e6 !important;
+    color: #553a08 !important;
 }
 #seed-gallery,
 #catalog-gallery {
@@ -2328,6 +4109,20 @@ CSS = """
 #catalog-gallery img,
 #detail-image img {
     border-radius: 6px;
+}
+#catalog-gallery img {
+    display: block !important;
+    width: 100% !important;
+    height: 100% !important;
+    min-height: 172px !important;
+    object-fit: cover !important;
+    background: #17211f !important;
+}
+#seed-gallery img {
+    transition: opacity 180ms ease, filter 180ms ease, transform 180ms ease;
+}
+#seed-gallery img:hover {
+    transform: scale(1.01);
 }
 #seed-gallery,
 #seed-gallery > div,
@@ -2348,6 +4143,18 @@ CSS = """
     background: #f8faf9 !important;
     color: var(--bc-ink) !important;
 }
+#catalog-gallery .thumbnail-item {
+    border: 1px solid var(--bc-line) !important;
+    border-radius: 8px !important;
+    min-height: 184px !important;
+    overflow: hidden !important;
+}
+#catalog-gallery .caption,
+#catalog-gallery figcaption,
+#catalog-gallery .empty,
+#catalog-gallery .empty * {
+    color: var(--bc-muted) !important;
+}
 #seed-gallery svg,
 #catalog-gallery svg {
     color: #789089 !important;
@@ -2367,8 +4174,82 @@ CSS = """
     border-bottom: 1px solid var(--bc-line) !important;
     border-radius: 0 !important;
 }
+#detail-image,
+#detail-image > div,
+#detail-image .image-container,
+#detail-image .wrap,
+#detail-image .empty {
+    background: #f8faf9 !important;
+    color: var(--bc-ink) !important;
+}
+#detail-image .label-wrap,
+#detail-image .block-label,
+#detail-image [data-testid="block-label"],
+#detail-image label {
+    background: #17211f !important;
+    color: #ffffff !important;
+    border: 1px solid #334155 !important;
+    border-radius: 0 0 4px 0 !important;
+}
+#detail-report,
+#detail-report > div,
+#detail-report .prose {
+    background: #f8faf9 !important;
+    color: var(--bc-ink) !important;
+}
+#detail-report {
+    border: 1px solid var(--bc-line) !important;
+    border-radius: 8px !important;
+    padding: 12px !important;
+}
+#detail-report .prose,
+#detail-report .prose p,
+#detail-report .prose li,
+#detail-report .prose span {
+    color: var(--bc-ink) !important;
+}
+#detail-report .prose strong {
+    color: var(--bc-teal-dark) !important;
+    font-weight: 780 !important;
+}
+#detail-report .prose code {
+    background: #17211f !important;
+    color: #ffffff !important;
+    border: 1px solid #334155 !important;
+    border-radius: 4px !important;
+    padding: 1px 4px !important;
+    font-size: 0.92em !important;
+}
+#detail-panel button {
+    background: #475569 !important;
+    border-color: #475569 !important;
+    color: #ffffff !important;
+    font-weight: 700 !important;
+}
+#detail-panel button:hover {
+    background: #334155 !important;
+    border-color: #334155 !important;
+}
 .bc-review {
     color: var(--bc-ink);
+}
+.bc-batch-prompt {
+    border: 1px solid #9fb9b2;
+    border-left: 5px solid var(--bc-teal);
+    border-radius: 8px;
+    background: #eef8f6;
+    color: var(--bc-ink);
+    padding: 12px;
+    margin-bottom: 12px;
+}
+.bc-batch-prompt h3 {
+    margin: 4px 0 10px;
+    font-size: 15px;
+    line-height: 1.25;
+    letter-spacing: 0;
+}
+.bc-batch-prompt .bc-compiled-prompt {
+    margin-bottom: 10px;
 }
 .bc-review-hero {
     display: flex;
@@ -2435,6 +4316,66 @@ CSS = """
     line-height: 1.25;
     letter-spacing: 0;
     color: var(--bc-teal-dark);
+}
+.bc-triplet-stack {
+    display: grid;
+    gap: 10px;
+}
+.bc-triplet-row {
+    display: grid;
+    grid-template-columns: minmax(170px, 1fr) minmax(140px, 0.72fr) minmax(170px, 1fr);
+    gap: 10px;
+    align-items: stretch;
+}
+.bc-triplet-box,
+.bc-standalone-object {
+    border: 1px solid #b9c8c1;
+    border-radius: 8px;
+    background: var(--bc-surface);
+    padding: 10px;
+    min-width: 0;
+}
+.bc-triplet-object {
+    border-left: 4px solid var(--bc-teal);
+}
+.bc-triplet-relation {
+    border-left: 4px solid var(--bc-amber);
+    background: #fff8e6;
+}
+.bc-triplet-kicker {
+    display: block;
+    color: var(--bc-muted);
+    font-size: 11px;
+    font-weight: 760;
+    text-transform: uppercase;
+    letter-spacing: 0;
+    margin-bottom: 4px;
+}
+.bc-triplet-box strong,
+.bc-standalone-object strong {
+    display: block;
+    color: var(--bc-ink);
+    font-size: 14px;
+    line-height: 1.25;
+    overflow-wrap: anywhere;
+}
+.bc-triplet-box small,
+.bc-standalone-object small {
+    display: block;
+    color: var(--bc-muted);
+    font-size: 12px;
+    line-height: 1.3;
+    margin: 4px 0 7px;
+    overflow-wrap: anywhere;
+}
+.bc-standalone-objects {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 10px;
+    margin-top: 12px;
+}
+.bc-standalone-objects .bc-eyebrow {
+    grid-column: 1 / -1;
 }
 .bc-object-grid {
     display: grid;
@@ -2605,11 +4546,21 @@ CSS = """
     .bc-review-grid {
         grid-template-columns: 1fr;
     }
+    .bc-triplet-row {
+        grid-template-columns: 1fr;
+    }
     .bc-review-block-wide {
         grid-column: auto;
     }
     .bc-workflow-row {
         flex-direction: column;
+    }
+    .bc-flow-svg {
+        display: none;
+    }
+    .bc-flow-svg-mobile {
+        display: block;
+        min-width: 0;
     }
     .bc-note {
         width: 100%;
@@ -2620,6 +4571,12 @@ CSS = """
     }
     #prompt-microphone {
         max-width: none;
+    }
+    #seed-slot-row {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    #catalog-slot-row {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
     }
     .bc-chip {
         grid-template-columns: 1fr;
@@ -2649,11 +4606,9 @@ def build_demo(mode: GradioMode | str | None = None) -> gr.Blocks:
     cancel_handler = cancel_pre_run_runtime if resolved_mode == "runtime" else cancel_pre_run
     generate_handler = generate_seed_sweep_runtime if resolved_mode == "runtime" else generate_seed_sweep
     feedback_handler = submit_feedback_runtime if resolved_mode == "runtime" else submit_feedback
-    start_event_handler = _maybe_zero_gpu(start_handler, duration=180) if resolved_mode == "runtime" else start_handler
-    generate_event_handler = (
-        _maybe_zero_gpu(generate_handler, duration=900) if resolved_mode == "runtime" else generate_handler
-    )
-    microphone_event_handler = _maybe_zero_gpu(transcribe_microphone_to_prompt_steps, duration=180)
+    start_event_handler = start_handler
+    generate_event_handler = generate_handler
+    microphone_event_handler = transcribe_microphone_to_prompt_steps
 
     with gr.Blocks(
         title="Bruteforce Canvas",
@@ -2664,21 +4619,22 @@ def build_demo(mode: GradioMode | str | None = None) -> gr.Blocks:
         with gr.Column(elem_id="bc-app"):
             gr.HTML('<header id="bc-title"><h1>BRUTEFORCE CANVAS</h1></header>')
             with gr.Accordion("Workflow diagram", open=True, elem_id="workflow-accordion"):
-                with gr.Row(elem_classes=["bc-workflow-row"]):
-                    with gr.Column(scale=6, min_width=420, elem_classes=["bc-workflow-diagram"]):
-                        gr.Markdown(
-                            WORKFLOW_MERMAID_MARKDOWN,
-                            elem_id="workflow-mermaid",
-                            container=False,
-                            padding=False,
-                        )
-                    with gr.Column(scale=4, min_width=320, elem_classes=["bc-workflow-explanation"]):
-                        gr.Markdown(
-                            WORKFLOW_EXPLANATION_MARKDOWN,
-                            elem_id="workflow-explanation",
-                            container=False,
-                            padding=False,
-                        )
+                with gr.Column(elem_classes=["bc-workflow-row"]):
+                    gr.HTML(
+                        WORKFLOW_DIAGRAM_HTML,
+                        elem_id="workflow-diagram",
+                        elem_classes=["bc-workflow-diagram"],
+                        container=False,
+                        padding=False,
+                    )
+                    gr.Markdown(
+                        WORKFLOW_EXPLANATION_MARKDOWN,
+                        elem_id="workflow-explanation",
+                        elem_classes=["bc-workflow-explanation"],
+                        container=False,
+                        padding=False,
+                    )
+
             with gr.Row(elem_classes=["bc-prompt-row"]):
                 microphone = gr.Microphone(
                     sources=["microphone"],
@@ -2699,36 +4655,49 @@ def build_demo(mode: GradioMode | str | None = None) -> gr.Blocks:
                     scale=8,
                 )
                 submit = gr.Button("Submit", variant="primary", scale=1, min_width=120, elem_id="prompt-submit")
-            status = gr.HTML(_status_html(initial_state()))
 
             with gr.Group(visible=False, elem_id="pre-run-panel") as review_panel:
                 parsed_report = gr.HTML()
-                lock_table = gr.Dataframe(
-                    headers=LOCK_TABLE_HEADERS,
-                    datatype=["bool", "str", "str", "str", "str", "str"],
-                    type="array",
-                    interactive=True,
-                    label="Enum locks",
-                    row_count=8,
-                    wrap=True,
-                )
+                with gr.Group(elem_id="lock-table-panel") as lock_table_panel:
+                    lock_table = gr.Dataframe(
+                        headers=LOCK_TABLE_HEADERS,
+                        datatype=["bool", "str", "str", "str", "str", "str", "str", "str", "str"],
+                        type="array",
+                        interactive=True,
+                        label="Enum locks",
+                        row_count=10,
+                        wrap=True,
+                        elem_id="lock-table",
+                    )
                 with gr.Row():
-                    iqa_cutoff = gr.Slider(0.0, 1.0, value=0.55, step=0.01, label="IQA cutoff")
+                    iqa_cutoff = gr.Slider(
+                        0.0,
+                        1.0,
+                        value=0.55,
+                        step=0.01,
+                        label="Image Quality Assessment cutoff",
+                    )
                     alignment_cutoff = gr.Slider(0.0, 1.0, value=0.25, step=0.01, label="Alignment cutoff")
                 with gr.Row():
                     generate = gr.Button("Generate", variant="primary", interactive=False)
                     cancel = gr.Button("Cancel")
 
             with gr.Group(visible=False, elem_id="active-panel") as active_panel:
-                seed_gallery = gr.Gallery(
-                    label="5-seed candidate sweep",
-                    columns=5,
-                    rows=1,
-                    height=320,
-                    allow_preview=True,
-                    object_fit="cover",
-                    elem_id="seed-gallery",
-                )
+                with gr.Row(elem_id="seed-slot-row"):
+                    seed_slots = [
+                        gr.Image(
+                            label=f"seed {seed}",
+                            type="filepath",
+                            interactive=False,
+                            height=320,
+                            buttons=["fullscreen"],
+                            elem_classes=["bc-seed-slot"],
+                            elem_id=f"seed-slot-{seed}",
+                        )
+                        for seed in DEFAULT_SEED_BUNDLE
+                    ]
+
+            status = gr.HTML(_status_html(initial_state()))
 
             with gr.Row():
                 with gr.Column(scale=3):
@@ -2740,10 +4709,43 @@ def build_demo(mode: GradioMode | str | None = None) -> gr.Blocks:
                         allow_preview=False,
                         object_fit="cover",
                         elem_id="catalog-gallery",
+                        visible=False,
                     )
+                    with gr.Group(visible=False, elem_id="catalog-slot-panel") as catalog_panel:
+                        gr.Markdown("Curated catalog", elem_id="catalog-slot-title")
+                        with gr.Row(elem_id="catalog-pagination"):
+                            catalog_prev_btn = gr.Button(
+                                "Prev page",
+                                size="sm",
+                                interactive=False,
+                                elem_id="catalog-prev-page",
+                            )
+                            catalog_page_status = gr.Markdown(
+                                _catalog_page_label(initial_state()),
+                                elem_id="catalog-page-status",
+                            )
+                            catalog_next_btn = gr.Button(
+                                "Next page",
+                                size="sm",
+                                interactive=False,
+                                elem_id="catalog-next-page",
+                            )
+                        with gr.Row(elem_id="catalog-slot-row"):
+                            catalog_slots = [
+                                gr.Image(
+                                    label=f"curated {index + 1}",
+                                    type="filepath",
+                                    interactive=False,
+                                    height=205,
+                                    buttons=["fullscreen"],
+                                    elem_classes=["bc-catalog-slot"],
+                                    elem_id=f"catalog-slot-{index + 1}",
+                                )
+                                for index in range(CATALOG_SLOT_COUNT)
+                            ]
                 with gr.Column(scale=2, visible=False, elem_id="detail-panel") as detail_panel:
                     detail_image = gr.Image(label="Selected image", elem_id="detail-image", height=430)
-                    detail_report = gr.Markdown()
+                    detail_report = gr.Markdown(elem_id="detail-report")
                     with gr.Row():
                         previous_btn = gr.Button("Prev", size="sm")
                         next_btn = gr.Button("Next", size="sm")
@@ -2752,15 +4754,71 @@ def build_demo(mode: GradioMode | str | None = None) -> gr.Blocks:
                         down_btn = gr.Button("Thumbs down", size="sm", variant="secondary")
                         trash_btn = gr.Button("Trash", size="sm", variant="stop")
 
+            def start_with_catalog_hidden(raw_prompt: str, current_state: Any):
+                next_state, panel, report, locks, generate_button, next_status = start_event_handler(
+                    raw_prompt,
+                    current_state,
+                )
+                return (
+                    next_state,
+                    panel,
+                    report,
+                    gr.update(value=locks, visible=True),
+                    generate_button,
+                    gr.update(visible=True),
+                    gr.update(visible=False),
+                    next_status,
+                )
+
+            def cancel_with_catalog_hidden(current_state: Any):
+                next_state, panel, generate_button, next_status = cancel_handler(current_state)
+                if _runtime_generation_started(_coerce_state(next_state)):
+                    return (
+                        next_state,
+                        panel,
+                        generate_button,
+                        gr.update(visible=False),
+                        gr.update(visible=False),
+                        gr.update(),
+                        next_status,
+                    )
+                return (
+                    next_state,
+                    panel,
+                    generate_button,
+                    gr.update(visible=False),
+                    gr.update(visible=False),
+                    gr.update(visible=False),
+                    next_status,
+                )
+
             submit.click(
-                start_event_handler,
+                start_with_catalog_hidden,
                 inputs=[prompt, state],
-                outputs=[state, review_panel, parsed_report, lock_table, generate, status],
+                outputs=[
+                    state,
+                    review_panel,
+                    parsed_report,
+                    lock_table,
+                    generate,
+                    lock_table_panel,
+                    catalog_panel,
+                    status,
+                ],
             )
             prompt.submit(
-                start_event_handler,
+                start_with_catalog_hidden,
                 inputs=[prompt, state],
-                outputs=[state, review_panel, parsed_report, lock_table, generate, status],
+                outputs=[
+                    state,
+                    review_panel,
+                    parsed_report,
+                    lock_table,
+                    generate,
+                    lock_table_panel,
+                    catalog_panel,
+                    status,
+                ],
             )
             microphone.change(
                 microphone_event_handler,
@@ -2768,27 +4826,48 @@ def build_demo(mode: GradioMode | str | None = None) -> gr.Blocks:
                 outputs=[prompt, state, status],
                 show_progress="minimal",
             )
-            cancel.click(cancel_handler, inputs=[state], outputs=[state, review_panel, generate, status])
+            cancel.click(
+                cancel_with_catalog_hidden,
+                inputs=[state],
+                outputs=[state, review_panel, generate, lock_table_panel, lock_table, catalog_panel, status],
+                queue=False,
+            )
             generate.click(
                 generate_event_handler,
-                inputs=[state, lock_table, iqa_cutoff, alignment_cutoff],
+                inputs=[state, lock_table, iqa_cutoff, alignment_cutoff, prompt],
                 outputs=[
                     state,
                     review_panel,
+                    parsed_report,
                     active_panel,
-                    seed_gallery,
+                    *seed_slots,
                     catalog_gallery,
-                    detail_panel,
-                    detail_image,
-                    detail_report,
+                    *catalog_slots,
+                    catalog_prev_btn,
+                    catalog_next_btn,
+                    catalog_page_status,
+                    catalog_panel,
+                    lock_table_panel,
+                    lock_table,
                     status,
                 ],
                 show_progress="minimal",
             )
-            catalog_gallery.select(
-                select_curated,
+            for slot_index, catalog_slot in enumerate(catalog_slots):
+                catalog_slot.select(
+                    lambda current_state, index=slot_index: select_curated_index(index, current_state),
+                    inputs=[state],
+                    outputs=[state, detail_panel, detail_image, detail_report, status],
+                )
+            catalog_prev_btn.click(
+                lambda current_state: move_catalog_page(current_state, -1),
                 inputs=[state],
-                outputs=[state, detail_panel, detail_image, detail_report, status],
+                outputs=[state, *catalog_slots, catalog_prev_btn, catalog_next_btn, catalog_page_status, status],
+            )
+            catalog_next_btn.click(
+                lambda current_state: move_catalog_page(current_state, 1),
+                inputs=[state],
+                outputs=[state, *catalog_slots, catalog_prev_btn, catalog_next_btn, catalog_page_status, status],
             )
             previous_btn.click(
                 lambda current_state: move_selection(current_state, -1),
@@ -2801,19 +4880,64 @@ def build_demo(mode: GradioMode | str | None = None) -> gr.Blocks:
                 outputs=[state, detail_panel, detail_image, detail_report, status],
             )
             up_btn.click(
-                lambda current_state: feedback_handler(current_state, FeedbackAction.ACCEPT.value),
+                lambda current_state: submit_feedback_with_catalog_slots(
+                    feedback_handler,
+                    current_state,
+                    FeedbackAction.ACCEPT.value,
+                ),
                 inputs=[state],
-                outputs=[state, catalog_gallery, detail_panel, detail_image, detail_report, status],
+                outputs=[
+                    state,
+                    catalog_gallery,
+                    *catalog_slots,
+                    catalog_prev_btn,
+                    catalog_next_btn,
+                    catalog_page_status,
+                    detail_panel,
+                    detail_image,
+                    detail_report,
+                    status,
+                ],
             )
             down_btn.click(
-                lambda current_state: feedback_handler(current_state, FeedbackAction.REJECT.value),
+                lambda current_state: submit_feedback_with_catalog_slots(
+                    feedback_handler,
+                    current_state,
+                    FeedbackAction.REJECT.value,
+                ),
                 inputs=[state],
-                outputs=[state, catalog_gallery, detail_panel, detail_image, detail_report, status],
+                outputs=[
+                    state,
+                    catalog_gallery,
+                    *catalog_slots,
+                    catalog_prev_btn,
+                    catalog_next_btn,
+                    catalog_page_status,
+                    detail_panel,
+                    detail_image,
+                    detail_report,
+                    status,
+                ],
             )
             trash_btn.click(
-                lambda current_state: feedback_handler(current_state, FeedbackAction.SHRED.value),
+                lambda current_state: submit_feedback_with_catalog_slots(
+                    feedback_handler,
+                    current_state,
+                    FeedbackAction.SHRED.value,
+                ),
                 inputs=[state],
-                outputs=[state, catalog_gallery, detail_panel, detail_image, detail_report, status],
+                outputs=[
+                    state,
+                    catalog_gallery,
+                    *catalog_slots,
+                    catalog_prev_btn,
+                    catalog_next_btn,
+                    catalog_page_status,
+                    detail_panel,
+                    detail_image,
+                    detail_report,
+                    status,
+                ],
             )
     return demo
 
@@ -2825,9 +4949,18 @@ def launch(
     share: bool = False,
     mode: GradioMode | str | None = None,
 ) -> None:
-    demo = build_demo(mode=mode)
+    resolved_mode = _resolve_gradio_mode(mode)
+    _prewarm_runtime_startup_if_enabled(resolved_mode)
+    demo = build_demo(mode=resolved_mode)
     demo.queue(default_concurrency_limit=1)
-    demo.launch(server_name=server_name, server_port=server_port, share=share, css=CSS, theme=_build_theme())
+    demo.launch(
+        server_name=server_name,
+        server_port=server_port,
+        share=share,
+        css=CSS,
+        theme=_build_theme(),
+        allowed_paths=[str(RUNTIME_RUN_ROOT.resolve())],
+    )
 
 
 if __name__ == "__main__":

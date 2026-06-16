@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import gc
 from pathlib import Path
+from threading import RLock
 from typing import Any
 
 from pydantic import Field
@@ -121,49 +123,107 @@ class LocalCohereTranscriber:
         self._processor: Any | None = None
         self._model: Any | None = None
         self._torch: Any | None = None
+        self._lock = RLock()
 
     def transcribe(self, audio: object) -> str:
-        sample_rate, audio_array = normalize_audio_input(audio)
-        processor, model, torch = self._load()
-        inputs = processor(
-            audio_array,
-            sampling_rate=sample_rate,
-            return_tensors="pt",
-            language=self.config.language,
-            punctuation=self.config.punctuation,
-        )
-        audio_chunk_index = inputs.get("audio_chunk_index")
-        inputs.to(device=model.device, dtype=model.dtype)
-        with torch.inference_mode():
-            output_ids = model.generate(**inputs, max_new_tokens=self.config.max_new_tokens)
-        return self._decode(processor, output_ids, audio_chunk_index).strip()
+        with self._lock:
+            sample_rate, audio_array = normalize_audio_input(audio)
+            processor, model, torch = self._load()
+            inputs = processor(
+                audio_array,
+                sampling_rate=sample_rate,
+                return_tensors="pt",
+                language=self.config.language,
+                punctuation=self.config.punctuation,
+            )
+            audio_chunk_index = inputs.get("audio_chunk_index")
+            inputs.to(device=model.device, dtype=model.dtype)
+            with torch.inference_mode():
+                output_ids = model.generate(**inputs, max_new_tokens=self.config.max_new_tokens)
+            return self._decode(processor, output_ids, audio_chunk_index).strip()
+
+    def prewarm(self, *, run_dummy_inference: bool = True) -> None:
+        with self._lock:
+            processor, model, torch = self._load()
+            if not run_dummy_inference:
+                return
+
+            try:
+                import numpy as np
+            except ModuleNotFoundError as error:  # pragma: no cover - numpy is provided by Gradio/Transformers.
+                raise RuntimeError("numpy is required for Cohere Transcribe ASR prewarm") from error
+
+            audio_array = np.zeros(TARGET_ASR_SAMPLE_RATE, dtype="float32")
+            inputs = processor(
+                audio_array,
+                sampling_rate=TARGET_ASR_SAMPLE_RATE,
+                return_tensors="pt",
+                language=self.config.language,
+                punctuation=self.config.punctuation,
+            )
+            inputs.to(device=model.device, dtype=model.dtype)
+            max_new_tokens = max(1, int(os.getenv("BC_ASR_PREWARM_MAX_NEW_TOKENS", "8")))
+            with torch.inference_mode():
+                model.generate(**inputs, max_new_tokens=max_new_tokens)
+
+    def unload(self) -> None:
+        with self._lock:
+            model = self._model
+            processor = self._processor
+            torch = self._torch
+            self._model = None
+            self._processor = None
+            self._torch = None
+
+        del model
+        del processor
+        gc.collect()
+        if torch is None:
+            return
+        cuda = getattr(torch, "cuda", None)
+        if cuda is None:
+            return
+        try:
+            if cuda.is_available():
+                cuda.empty_cache()
+        except Exception:
+            return
 
     def _load(self) -> tuple[Any, Any, Any]:
-        if self._processor is not None and self._model is not None and self._torch is not None:
+        with self._lock:
+            if self._processor is not None and self._model is not None and self._torch is not None:
+                return self._processor, self._model, self._torch
+
+            import torch
+            from transformers import AutoProcessor, CohereAsrForConditionalGeneration
+
+            if self.config.require_cuda and not torch.cuda.is_available():
+                raise RuntimeError("Cohere Transcribe ASR requires CUDA; set BC_ASR_REQUIRE_CUDA=false to override")
+
+            try:
+                processor = AutoProcessor.from_pretrained(
+                    self.config.model_id,
+                    cache_dir=self.config.cache_dir,
+                    local_files_only=self.config.local_files_only,
+                    token=self.config.token,
+                )
+                model = CohereAsrForConditionalGeneration.from_pretrained(
+                    self.config.model_id,
+                    cache_dir=self.config.cache_dir,
+                    local_files_only=self.config.local_files_only,
+                    token=self.config.token,
+                    device_map=self.config.device_map,
+                )
+            except Exception:
+                self._processor = None
+                self._model = None
+                self._torch = None
+                raise
+            model.eval()
+            self._processor = processor
+            self._model = model
+            self._torch = torch
             return self._processor, self._model, self._torch
-
-        import torch
-        from transformers import AutoProcessor, CohereAsrForConditionalGeneration
-
-        if self.config.require_cuda and not torch.cuda.is_available():
-            raise RuntimeError("Cohere Transcribe ASR requires CUDA; set BC_ASR_REQUIRE_CUDA=false to override")
-
-        self._processor = AutoProcessor.from_pretrained(
-            self.config.model_id,
-            cache_dir=self.config.cache_dir,
-            local_files_only=self.config.local_files_only,
-            token=self.config.token,
-        )
-        self._model = CohereAsrForConditionalGeneration.from_pretrained(
-            self.config.model_id,
-            cache_dir=self.config.cache_dir,
-            local_files_only=self.config.local_files_only,
-            token=self.config.token,
-            device_map=self.config.device_map,
-        )
-        self._model.eval()
-        self._torch = torch
-        return self._processor, self._model, self._torch
 
     def _decode(self, processor: Any, output_ids: Any, audio_chunk_index: Any) -> str:
         kwargs: dict[str, object] = {

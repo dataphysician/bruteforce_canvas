@@ -1,129 +1,346 @@
----
-title: Bruteforce Canvas
-license: cc-by-nc-4.0
-sdk: gradio
-sdk_version: 6.18.0
-python_version: 3.12
-app_file: app.py
-suggested_hardware: zero-a10g
-tags:
-  - track:backyard
-  - track:wood
-  - sponsor:openbmb
-  - sponsor:openai
-  - sponsor:modal
----
-
 # Bruteforce Canvas
 
-Bruteforce Canvas is a local-first image generation and evaluation loop. It turns a user prompt into a structured prompt document, renders generation coordinates, generates candidate images, evaluates them, promotes the strongest candidates, and records the run to a replayable JSONL event store.
+Bruteforce Canvas is an experimental self-curating image generation engine. It turns one user intent into a structured search problem, sweeps prompt-token and seed combinations, evaluates the resulting images, learns which combinations stay inside the image model's training distribution, and promotes only the strongest candidates into a curated catalog.
 
-It was built to make image iteration less subjective. The system keeps generation, quality scoring, prompt-image alignment, thresholds, feedback, and replay telemetry in one workflow so a user can inspect why an image was promoted or rejected.
+The project is built around a practical bottleneck in image tools: when a generator stops after one prompt, the user becomes the optimizer. They must think of the next prompt, retry seeds, remember what worked, discard broken outputs, and mentally infer which words improved quality. Bruteforce Canvas moves that cognitive burden into a repeatable backend loop.
 
-## License
+The long-term aim is a system that can build an increasingly useful dataset for the user's own image-quality model. Automated evaluators catch low-quality or off-prompt images first; human feedback then adds personal taste, style, and failure preferences. Over time, the engine should learn not just what generally looks good, but what looks good for this user and this visual domain.
 
-This repository is licensed under CC BY-NC 4.0. The non-commercial license posture is intentional because the optional TRIBE v2 adapter targets a CC BY-NC 4.0 model family.
+## Status
 
-## Hackathon Thesis
+This repository is a research and engineering prototype. The license status is not finalized in this README. Do not treat this document as a license grant.
 
-Bruteforce Canvas is an image-generation workbench built around the idea that a single prompt should become a searchable experiment, not a one-shot generation. The system decomposes a natural-language request into a structured prompt document, repairs and validates ambiguous fields, canonicalizes the result into locked and sampleable enums, explores candidate generation coordinates with LHS plus Bayesian learning, then rapidly screens generated images with IQA and VLM alignment before promoting only the surviving images into a curated catalog.
+Runtime integrations are intentionally adapter-based. Local development can run with static adapters and deterministic fixtures; real runs can wire in ASR, an OpenAI-compatible prompt LLM, a fast image generator, IQA, VLM alignment, and optional impact scoring through environment configuration.
 
-The UI is intentionally a control surface for the full loop. Users can type or record a prompt, inspect the decomposition before generation, lock important enum choices, set quality and alignment thresholds, launch a 5-seed sweep, see failed images muted with red borders, and review promoted images with prompt, seed, score, and feedback metadata. The result is an auditable loop: every accepted, rejected, or shredded image can become learning signal for the next coordinate.
+## What It Does
 
-## End-to-End Workflow
+Bruteforce Canvas converts a natural language request into a measurable generation experiment.
 
-1. **ASR / text input:** a typed prompt or microphone recording becomes prompt text. The local ASR path uses `CohereLabs/cohere-transcribe-03-2026`, resamples microphone audio to `16 kHz`, defaults to English, keeps punctuation enabled, and decodes with `max_new_tokens=256`.
-2. **Mellum2 Thinking 12B via Modal Cloud:** runtime extraction calls an OpenAI-compatible Modal endpoint serving `mellum2-thinking`, configured as the Mellum2 Thinking 12B reasoning path for structured prompt work.
-3. **Extraction / Decomposition:** the prompt is converted into a `PromptDocumentSpec` with object, relation, action, cinematography, and constraint lanes. The runtime LLM path uses strict JSON schema output, `temperature=0.0`, `max_completion_tokens=2048`, and `timeout_seconds=600`.
-4. **Repair / Validate:** the verifier blocks underspecified prompts, detects unresolved relation targets, and translates internal evidence failures into user-facing retry instructions. Generation cannot start until blocking validation issues are resolved.
-5. **Enum Canonicalization:** raw prompt values are mapped into project enums. The embedding canonicalizer defaults to `BAAI/bge-small-en-v1.5` with `match_threshold=0.62`, and can fall back to the LLM path for uncertain cases.
-6. **Pre-run locks:** explicit or user-approved values can be locked before generation. Unlocked fields remain available for coordinate search.
-7. **LHS coordinate proposal:** the `LHSRouter` proposes coverage-oriented coordinates across sampleable enum arms while preserving locked evidence and compatibility constraints.
-8. **Thompson Sampling + GP:** enum arms carry Thompson-style `alpha`/`beta` state, while feedback and evaluation aggregates can update Bayesian affinity. The GP layer encodes enum coordinates and predicts posterior mean/variance for combo scoring when enough observations exist.
-9. **Bayesian Inferencing:** the router combines Thompson arm expectation and compatibility priors into a `bayesian_score_before_generation`. Feedback actions apply learning deltas: accept increases `alpha` and GP affinity, reject increases `beta`, and shred applies a stronger negative signal.
-10. **Quick Generation:** each selected coordinate expands into a 5-seed batch using `[7, 42, 156, 8888, 42069]`. The runtime Gradio path defaults to `steps=4`, `height=512`, and `width=512` for fast preview loops.
-11. **Rapid IQA evaluation:** JoyQuality scores every generated image first. The default quality cutoff is `0.55`; failed images are retained as evidence but visually muted and excluded from alignment scoring.
-12. **VLM image-prompt alignment:** survivors are scored by MiniCPM-V against the compiled prompt and target manifest. The default alignment cutoff is `0.25`.
-13. **Optional TRIBE v2 impact:** `Jessylg27/tribev2-lite-qv` is wired as an optional metacognitive impact adapter, disabled by default and treated as non-commercial. The default policy requires at least `24 GiB` VRAM before enabling impact scoring.
-14. **Curated catalog + feedback:** candidates are classified as fragile, viable, or strong based on seed survival. Curated images expose prompt, seed, scores, metadata, and thumbs-up / thumbs-down / trash feedback.
-15. **Prior updates:** feedback and evaluation evidence update priors for individual enum arms and enum combinations. These updates feed the Thompson sampler, GP affinity, compatibility priors, and subsequent LHS coordinate scoring.
-16. **Persistence and replay:** run config, prompt documents, generated candidates, evaluations, aggregate stats, feedback, priors, and diagnostics are persisted as JSONL records and can be replayed into a static report.
+Given typed text or transcribed audio, the system:
+
+1. Extracts the user's intended scene, objects, relations, style, constraints, and cinematography into a structured prompt document.
+2. Normalizes raw language into standardized cinematic and photography terms.
+3. Preserves explicit user intent as locked fields and exposes weak or missing fields as sampleable search dimensions.
+4. Uses Latin-hypercube-style coverage plus Bayesian priors to choose prompt-coordinate combinations.
+5. Generates multiple seeds per coordinate instead of trusting one image.
+6. Runs a fast image quality gate before spending more expensive evaluator time.
+7. Runs prompt-image alignment on quality survivors.
+8. Promotes candidates based on seed-batch survival, not just one lucky sample.
+9. Records candidate, score, feedback, and prior updates to a replayable event log.
+10. Feeds accepted, rejected, and shredded images back into the search policy.
+
+The product surface is therefore not a prompt box with a gallery. It is a controlled experimentation loop for image generation.
+
+## Why This Exists
+
+Most image-generation interfaces hide the hardest part of the work. They expose the prompt, maybe a seed, and then leave the user to do manual optimization. That creates several problems:
+
+- **Prompt iteration is cognitive labor.** Users must invent variations, remember results, and decide what to retry.
+- **Seed luck is mistaken for prompt quality.** A single successful image can hide a brittle prompt.
+- **Bad generations waste attention.** Users visually inspect failures that cheap evaluators could have filtered.
+- **Preference data is thrown away.** Likes, rejects, and deletes rarely become structured learning signal.
+- **Datasets are an afterthought.** The best outputs are not automatically organized as training evidence.
+
+Bruteforce Canvas treats every generation as a data point. The system keeps the prompt coordinate, seed, generator settings, IQA result, alignment result, curation decision, and feedback action together. That makes the run inspectable, replayable, and learnable.
+
+## How It Works
+
+### 1. Prompt Intake
+
+The UI accepts either typed text or microphone audio. Audio is normalized and transcribed into text, then the rest of the pipeline treats the transcript exactly like a typed prompt.
+
+The ASR path is isolated from prompt semantics. That matters because ASR should not decide what is important in the scene; it should only produce faithful text for the prompt compiler.
+
+### 2. Prompt Compiler
+
+The prompt compiler converts raw language into a `PromptDocumentSpec`. This document is the core contract between the UI, router, generator, evaluators, and persistence layer.
+
+It captures:
+
+- scene graph elements,
+- object descriptors,
+- relation descriptors,
+- action lanes,
+- cinematography lanes,
+- constraints,
+- evidence spans,
+- verification issues,
+- canonical enum matches,
+- target manifests for image evaluation.
+
+The key engineering rule is that raw intent is preserved. The system can normalize "inside a glass display case" into canonical terms, but it keeps the original evidence so downstream failures remain explainable.
+
+### 3. Canonicalization
+
+Raw prompt phrases are mapped to project enums before generation. This gives the router a typed search space instead of an unbounded text mutation problem.
+
+Examples of canonicalized dimensions include:
+
+- object role,
+- entity type,
+- color,
+- material,
+- finish,
+- lighting,
+- framing,
+- camera angle,
+- relation type,
+- constraint strength.
+
+The embedding-first canonicalizer provides a deterministic first pass. An LLM fallback can be enabled for uncertain matches, but the fallback is field-scoped: it sees the field and local enum context, not the whole prompt. That keeps canonicalization narrow and easier to test.
+
+### 4. Pre-Run Review And Locks
+
+Before generation begins, the user can review what the system understood. Explicit or user-approved values become locked. Weak, missing, or user-editable fields become search axes.
+
+This is the boundary between intent and optimization:
+
+- locked fields protect what the user asked for,
+- sampleable fields let the engine explore,
+- thresholds define the minimum acceptable evidence for promotion.
+
+The UI should not behave like a graph editor. It is a trust-but-adjust checkpoint before the backend starts sweeping.
+
+### 5. Coordinate Search
+
+The router proposes generation coordinates across sampleable enum dimensions. A coordinate is a structured prompt variant, not a random rewritten prompt.
+
+The routing policy combines:
+
+- Latin-hypercube-style coverage across enum axes,
+- compatibility constraints between enum values,
+- Thompson-style arm priors for individual enum choices,
+- optional GP-style affinity over enum combinations,
+- feedback deltas from accepted, rejected, and shredded candidates.
+
+The result is an exploration policy that can try broad coverage early and become more exploitative as evidence accumulates.
+
+### 6. Seed Sweeping
+
+Each selected coordinate expands into a fixed seed bundle. The default runtime path uses a five-seed sweep. This is important because prompt quality is not the same thing as one lucky output.
+
+Promotion is based on batch behavior:
+
+- one survivor means fragile,
+- two survivors means viable,
+- three or more survivors means strong.
+
+This gives the system a cheap robustness estimate for each prompt coordinate.
+
+### 7. Fast Generation
+
+The generator adapter is model-agnostic. The current real path targets a fast preview generator, while tests and local development can use a stub generator.
+
+The important interface is simple:
+
+```text
+rendered prompt + seed + generation settings -> image artifact + metadata
+```
+
+That adapter boundary keeps the rest of the engine independent from one image backend.
+
+### 8. Automated Evaluation
+
+Evaluation is staged deliberately.
+
+First, IQA filters image quality. Low-quality images are retained as evidence but do not spend VLM alignment time.
+
+Second, VLM alignment checks whether quality survivors match the compiled prompt and target manifest.
+
+Third, optional impact scoring can run downstream of required gates. It is informational by default and should stay disabled unless capacity, policy, and licensing conditions are clear.
+
+This order is an AI-engineering choice: cheap gates first, expensive semantic gates later, optional metadata last.
+
+### 9. Curated Catalog
+
+The catalog only promotes candidates that survived automated checks. Failed images are not silently deleted; they are useful negative evidence. The UI can show them muted or keep them in diagnostics while focusing user attention on candidates worth reviewing.
+
+Each promoted image carries:
+
+- candidate id,
+- coordinate id,
+- seed,
+- rendered prompt,
+- generator settings,
+- IQA score,
+- alignment score,
+- promotion band,
+- feedback state,
+- persistence record references.
+
+### 10. Feedback And Learning
+
+Human feedback is intentionally small and high-signal:
+
+- **accept** means the candidate should influence future search positively,
+- **reject** means it is not preferred,
+- **shred** means the candidate is a stronger negative example.
+
+Those actions update priors for enum arms and combinations. The feedback is also useful as future dataset labeling for a user-specific IQA model.
+
+### 11. Persistence And Replay
+
+Every major backend event is written to JSONL:
+
+- run configuration,
+- prompt documents,
+- coordinates,
+- generation requests,
+- candidate records,
+- image evaluations,
+- aggregate seed-batch stats,
+- feedback actions,
+- prior updates,
+- stop reasons,
+- diagnostics.
+
+This makes a run auditable. A static report or replay UI can reconstruct why an image was generated, why it passed or failed, and how it affected later search.
+
+## Data Science View
+
+Bruteforce Canvas frames image generation as sequential experimental design.
+
+The basic unit of observation is:
+
+```text
+(prompt coordinate, seed, generation settings) -> image -> evaluator scores -> feedback
+```
+
+The feature space is built from canonical prompt enums and compatibility relationships. The target signals are automated quality, automated alignment, batch survival, and human feedback.
+
+The learning problem is not "find the best prompt globally." It is closer to:
+
+```text
+Given a base user intent, estimate which prompt-token combinations and seed neighborhoods produce images that are high quality, aligned, and preferred by this user.
+```
+
+The current policy uses lightweight Bayesian structure:
+
+- arm-level alpha/beta priors for individual enum choices,
+- compatibility priors for known good or bad pairings,
+- GP-style combination scoring when enough observations exist,
+- explicit feedback deltas for accept/reject/shred,
+- batch survival as a robustness proxy.
+
+This is deliberately pragmatic. The system needs enough statistical memory to improve the next sweep, but it should stay interpretable enough that a user can inspect why a coordinate was selected.
+
+## AI Engineering View
+
+The codebase separates heavy model behavior behind adapters:
+
+- prompt LLM client,
+- ASR transcriber,
+- embedding canonicalizer,
+- generator adapter,
+- IQA adapter,
+- VLM alignment adapter,
+- optional impact adapter.
+
+Static adapters keep tests deterministic and let backend development run without GPU dependencies. Real adapters lazy-import heavy libraries so the package can be installed for core backend work without pulling the full model stack.
+
+The main engineering contracts are:
+
+- Pydantic schemas for prompt documents and runtime records,
+- adapter methods with small input/output surfaces,
+- JSONL persistence for replayability,
+- explicit stage gates for generation and evaluation,
+- environment-based runtime configuration,
+- optional dependency extras for UI, ASR, and ML workloads.
+
+This keeps the system deployable in multiple profiles:
+
+- backend-only development,
+- Gradio simulation,
+- Gradio runtime with static evaluators,
+- runtime with real ASR,
+- runtime with real generator and evaluators,
+- external generator service with local orchestration.
+
+## Model And Adapter Stack
+
+| Stage | Adapter | Default / expected role |
+| --- | --- | --- |
+| ASR | `LocalCohereTranscriber` | Converts microphone audio into prompt text. |
+| Prompt LLM | `OpenAICompatibleServerJsonLLMClient` | Calls an externally configured OpenAI-compatible JSON-schema server for extraction, repair, and verification. |
+| Canonicalization | `EmbeddingCanonicalizerAdapter` | Maps raw field values into canonical enum arms. |
+| Fallback canonicalization | `LLMCanonicalizerAdapter` | Optional field-scoped fallback when embedding confidence is low. |
+| Generation | `StubGeneratorAdapter`, `BonsaiTernaryAdapter`, `BonsaiHttpAdapter` | Produces seed-sweep image artifacts. |
+| IQA | `JoyQualityAdapter` | Fast image-quality screen before alignment. |
+| Alignment | `MiniCPMVAdapter` or `OpenAICompatibleVLMAlignmentAdapter` | Checks prompt-image match against the compiled target manifest. |
+| Optional impact | `TRIBEv2Adapter` | Optional downstream metadata, disabled by default. |
+| Routing | `LHSRouter`, `ThompsonArmState`, compatibility priors, combo GP helpers | Selects the next prompt coordinate. |
+| Persistence | `JsonlEventStore` | Records the run for replay and analysis. |
+
+Concrete private service endpoints, tokens, and deployment-specific model names should be supplied through environment variables or external secrets, not committed into the repository.
+
+## Workflow
 
 ```mermaid
 flowchart TD
-  Mic["Microphone audio"] --> ASR["ASR transcript<br/>Cohere Transcribe path"]
-  Typed["Typed prompt"] --> Prompt["Prompt text"]
-  ASR --> Prompt
-  Prompt --> Mellum["Mellum2 Thinking 12B<br/>via Modal Cloud<br/>structured JSON schemas"]
-  Mellum --> Parse["PromptDocument extraction<br/>canonicalize + verify"]
-  Parse --> Locks["Pre-run locks + thresholds<br/>IQA >= 0.55<br/>Alignment >= 0.25<br/>Human IQA >= 0.70"]
-  Locks --> Coord["LHS coordinate coord_###<br/>compatibility + Bayesian score"]
-  Coord --> Seeds["5-seed batch<br/>[7, 42, 156, 8888, 42069]<br/>minimum bundle: 3"]
-  Seeds --> IQA{"JoyQuality IQA<br/>score >= 0.55?"}
-  IQA -- "fail" --> Persist["Persist candidate + failure evidence"]
-  IQA -- "pass" --> VLM{"MiniCPM-V alignment<br/>score >= 0.25?"}
-  VLM -- "fail" --> Persist
-  VLM -- "pass" --> Impact{"TRIBE impact enabled?<br/>optional cutoff"}
-  Impact -- "disabled or pass" --> Curated["Curated catalog<br/>fragile: 1 promoted<br/>viable: 2 promoted<br/>strong: >= 3 promoted"]
-  Curated --> Feedback["Accept / reject / shred feedback"]
-  Feedback --> Priors["Update priors<br/>enum arms alpha/beta<br/>enum-combo GP affinity"]
-  Priors --> Persist
-  Persist --> Stop{"Stop rule?"}
-  Stop -- "Gradio runtime cap: 15 minutes" --> End["Stop run"]
-  Stop -- "stall: fewer than 10 curated after 10 minutes" --> End
-  Stop -- "backend/requested stop" --> End
-  Stop -- "continue with updated priors" --> Coord
+  Input["Audio or typed prompt"] --> ASR["Optional ASR transcript"]
+  ASR --> Text["Prompt text"]
+  Text --> Extract["Prompt extraction to PromptDocumentSpec"]
+  Extract --> Canon["Enum canonicalization"]
+  Canon --> Review["Pre-run review and locks"]
+  Review --> Router["LHS + Bayesian coordinate router"]
+  Router --> Seeds["5-seed generation batch"]
+  Seeds --> IQA{"IQA pass?"}
+  IQA -- "no" --> Store["Persist evidence"]
+  IQA -- "yes" --> VLM{"Alignment pass?"}
+  VLM -- "no" --> Store
+  VLM -- "yes" --> Catalog["Curated catalog"]
+  Catalog --> Feedback["Accept / reject / shred"]
+  Feedback --> Priors["Update priors"]
+  Priors --> Store
+  Store --> Stop{"Stop rule?"}
+  Stop -- "continue" --> Router
+  Stop -- "done" --> End["Replayable run artifact"]
 ```
 
-## Model Stack and Parameters
+## Installation Profiles
 
-| Stage | Model / adapter | Default parameters | Purpose |
-| --- | --- | --- | --- |
-| ASR | `CohereLabs/cohere-transcribe-03-2026` through `LocalCohereTranscriber` | `sample_rate=16000`, `language=en`, `punctuation=true`, `max_new_tokens=256`, `device_map=auto`, `require_cuda=true` | Converts microphone recordings into prompt text without changing the rest of the prompt pipeline. |
-| Prompt extraction / repair | Mellum2 Thinking 12B via Modal Cloud and `OpenAICompatibleServerJsonLLMClient` | `model=mellum2-thinking`, `temperature=0.0`, `max_completion_tokens=2048`, `timeout_seconds=600`, strict `json_schema` response format | Produces structured prompt documents, repairs invalid JSON, and validates against Pydantic schemas. |
-| Enum canonicalization | `BAAI/bge-small-en-v1.5` through the embedding canonicalizer | `match_threshold=0.62`, `llm_fallback=true`, `device=auto` | Maps raw prompt phrases into canonical enum arms for relation, object, action, lighting, framing, and constraint fields. |
-| Quick image generation | `prism-ml/bonsai-image-ternary-4B-gemlite-2bit` through `BonsaiTernaryAdapter`, or `BonsaiHttpAdapter` for a remote runtime | `steps=4`, `height=512`, `width=512`, seed bundle `[7, 42, 156, 8888, 42069]`, kernel warmup enabled by default | Generates fast seed sweeps for each selected coordinate. |
-| Rapid IQA | `fancyfeast/joyquality-siglip2-so400m-512-16-05k047vn` through `JoyQualityAdapter` | image size `512`, default cutoff `0.55`, lazy prewarm | Filters low-quality images before spending VLM time. |
-| VLM image-prompt alignment | `openbmb/MiniCPM-V-4.6` through `MiniCPMVAdapter` | default cutoff `0.25`, downsample mode `16x`, `max_new_tokens=128`, lazy prewarm | Checks whether surviving images actually match the compiled prompt and target manifest. |
-| Optional impact | `Jessylg27/tribev2-lite-qv` through `TRIBEv2Adapter` | disabled by default, requires policy approval and `metacognitive_min_vram_gib=24` | Adds optional TRIBE v2 metacognitive impact scoring after quality and alignment pass. |
-| Bayesian routing | `LHSRouter`, `ThompsonArmState`, `ComboGPModel`, compatibility priors | Thompson `alpha/beta` arms, compatibility prior score, GP posterior mean/variance, feedback deltas `accept=(+alpha,+0.2 affinity)`, `reject=(+beta,-0.2)`, `shred=(+2 beta,-0.5)` | Chooses the next coordinate and learns from evaluation and user feedback. |
-
-## Core System Concepts
-
-**ASR:** The recorder is deliberately separated from prompt semantics. Audio is normalized, resampled, and transcribed lazily; the resulting transcript is treated exactly like typed text. This makes the microphone path future-proof without forcing ASR to be loaded during initial UI startup.
-
-**Extraction / Decomposition:** The prompt document is the central contract. It separates the raw user request into graph elements, object descriptors, relation descriptors, cinematography controls, and constraints. This is what lets the system say, "the rose is locked, but lighting mood can still be explored."
-
-**Repair / Validate:** Generation is not allowed to proceed just because an LLM returned plausible JSON. The verifier checks that required objects and relationships are grounded, blocking issues are surfaced, and internal schema failures are translated into useful user prompts. This is the difference between a demo prompt parser and a reliable generation loop.
-
-**Enum Canonicalization:** Canonical enums make image search measurable. A phrase like "inside a glass case" can become a locked relation enum, while underspecified fields become sampleable arms. This gives the generator controlled variation instead of random prompt mutation.
-
-**LHS:** Latin-hypercube-style routing spreads exploration across enum axes so one run does not over-sample the same cinematography or relation value. Locked fields remain fixed; missing or weak fields become structured exploration dimensions.
-
-**Thompson Sampling + GP:** The Bayesian layer gives the loop memory. Thompson sampling prefers arms with stronger historical pass rates while still allowing exploration. GP-style combo scoring provides posterior mean and uncertainty for coordinate combinations, so the system can prefer promising combinations and still discover new ones.
-
-**Quick Generation:** The generator is optimized for fast seed sweeps, not single perfect outputs. A 5-seed bundle is enough to detect fragility: one pass is fragile, two passes are viable, and three or more passes are strong.
-
-**Rapid IQA Evaluation:** IQA runs before VLM alignment because it is the cheaper first gate. This prevents obviously broken or low-quality images from consuming alignment evaluator time.
-
-**VLM Image-Prompt Alignment:** Alignment is scored only on IQA survivors. MiniCPM-V receives the generated image plus the compiled prompt/manifest and returns a parseable score. This makes visual correctness explicit rather than relying on subjective manual review.
-
-**Bayesian Inferencing:** Every generated coordinate carries pre-generation Bayesian context, and every evaluation or user feedback action can become posterior evidence. The curated catalog is therefore not just a gallery; it is a learning surface for subsequent coordinate selection.
-
-**TRIBE v2:** TRIBE v2 is deliberately optional, downstream, and disabled by default. It can add impact-style metadata only after the required quality and alignment gates pass, and its CC BY-NC 4.0 posture is why the repository uses a non-commercial license.
-
-The prompt LLM is Mellum2 served as an OpenAI-compatible vLLM endpoint on Modal:
+Create and activate a local virtual environment:
 
 ```bash
-export BC_LLM_PROVIDER=openai-compatible-server
-export BC_LLM_BASE_URL=https://dataphysician--mellum2-vllm-openai.modal.run/v1
-export BC_LLM_MODEL=mellum2-thinking
-export BC_LLM_TIMEOUT_SECONDS=600
+uv venv .venv --python 3.12
+source .venv/bin/activate
 ```
+
+Install backend core plus test tooling:
+
+```bash
+uv pip install -e '.[dev]'
+```
+
+Install the Gradio UI only when you need the UI or Gradio-specific tests:
+
+```bash
+uv pip install -e '.[dev,ui]'
+```
+
+Install microphone ASR dependencies:
+
+```bash
+uv pip install -e '.[dev,ui,asr]'
+```
+
+Install real-model ML dependencies:
+
+```bash
+uv pip install -e '.[ml]'
+```
+
+Install everything for a real-model UI development environment:
+
+```bash
+uv pip install -e '.[dev,ui,asr,ml]'
+```
+
+The UI dependencies are intentionally not part of the backend/dev extra. Backend tests and core engine development should not require Gradio.
 
 ## Configuration
 
-Common environment options:
+Common local defaults:
 
 ```bash
 export BC_GENERATOR=stub
@@ -135,11 +352,38 @@ export BC_IMPACT_ENABLED=false
 export BC_EVENT_STORE=runtime/events.jsonl
 ```
 
-On Hugging Face Spaces, the Space is configured for ZeroGPU with `suggested_hardware: zero-a10g`. The Gradio UI wraps the GPU-capable microphone transcription and runtime generation callbacks with `spaces.GPU` when the `spaces` package is available. Set `BC_ZEROGPU_CALLBACKS=false` only for local debugging when the callback wrapper should be bypassed.
+Configure the prompt LLM with an external OpenAI-compatible server:
 
-Keep the Bonsai backend outside this repository. Clone and install the external Bonsai Image Demo backend in a separate directory, then point this app at the directory that contains `backend_gpu/server.py`. Model weights can live under `BC_BONSAI_MODEL_ROOT`, or the backend can resolve `prism-ml/bonsai-image-ternary-4B-gemlite-2bit` through the Hugging Face cache when the local model directory does not exist.
+```bash
+export BC_LLM_PROVIDER=openai-compatible-server
+export BC_LLM_BASE_URL=https://your-json-llm.example/v1
+export BC_LLM_MODEL=your-json-model
+export BC_LLM_API_KEY=...
+export BC_LLM_TIMEOUT_SECONDS=600
+export BC_LLM_PREWARM=true
+```
 
-Required Bonsai runtime environment:
+Runtime launch can prewarm the configured prompt LLM by sending one small `PromptDocumentSpec` request before binding the UI. Set `BC_LLM_PREWARM=false` for local debugging, or `BC_LLM_PREWARM_REQUIRED=true` when startup should fail instead of continuing after a warmup error.
+
+ASR prewarm options:
+
+```bash
+export BC_ASR_PREWARM=true
+export BC_ASR_PREWARM_INFERENCE=true
+export BC_ASR_PREWARM_REQUIRED=false
+export BC_ASR_RELEASE_AFTER_TRANSCRIBE=false
+export BC_ASR_RELEASE_BEFORE_RUNTIME_SERVICE=false
+```
+
+Configure an external fast image backend through HTTP:
+
+```bash
+export BC_GENERATOR=bonsai-http
+export BC_BONSAI_HTTP_URL=http://127.0.0.1:7950
+export BC_BONSAI_HTTP_TOKEN=...
+```
+
+Or configure a local generator backend kept outside this repository:
 
 ```bash
 export BC_GENERATOR=bonsai
@@ -150,52 +394,49 @@ export BC_BONSAI_TRITON_CACHE=runtime/.triton_cache
 export BC_BONSAI_KERNEL_WARMUP=true
 ```
 
-With `BC_BONSAI_KERNEL_WARMUP=true`, Bonsai startup runs one disposable `512x512` dummy generation with `steps=4` after loading the pipeline. This pays Triton/GemLite kernel compilation before the user's first real seed. Override the warmup workload with `BC_BONSAI_WARMUP_PROMPT`, `BC_BONSAI_WARMUP_STEPS`, `BC_BONSAI_WARMUP_HEIGHT`, and `BC_BONSAI_WARMUP_WIDTH`, or disable it with `BC_BONSAI_KERNEL_WARMUP=false`.
+With `BC_BONSAI_KERNEL_WARMUP=true`, startup runs one disposable `512x512` dummy generation with `steps=4` after loading the pipeline. Override the warmup workload with `BC_BONSAI_WARMUP_PROMPT`, `BC_BONSAI_WARMUP_STEPS`, `BC_BONSAI_WARMUP_HEIGHT`, and `BC_BONSAI_WARMUP_WIDTH`, or disable it with `BC_BONSAI_KERNEL_WARMUP=false`.
 
-Before starting a longer run, execute a real Bonsai smoke generation when you want an explicit PNG artifact. It prewarms the pipeline, writes one `512x512` PNG with `steps=4`, validates the PNG header, and prints elapsed time plus CUDA memory counters when available:
-
-```bash
-.venv/bin/python -m bruteforce_canvas.cli bonsai-smoke --output-dir runtime/bonsai_smoke
-```
-
-Create and use a repo-local virtual environment:
+Fast-parse runtime profile:
 
 ```bash
-uv venv .venv --python 3.12
-source .venv/bin/activate
+export BC_RUNTIME_FAST_PARSE=true
 ```
 
-Install the base package and test tooling:
+Fast parse keeps LLM extraction and embedding canonicalization, but disables the more expensive semantic validation, verifier calls, verifier repair loops, and LLM fallback canonicalization. Set `BC_RUNTIME_FAST_PARSE=false` to restore the stricter compiler, or selectively re-enable gates with:
 
 ```bash
-uv pip install -e '.[dev]'
+export BC_RUNTIME_SEMANTIC_VALIDATION=true
+export BC_RUNTIME_VERIFIER=true
+export BC_RUNTIME_SEMANTIC_REPAIRS=1
+export BC_RUNTIME_VERIFIER_REPAIRS=1
+export BC_RUNTIME_LLM_CANONICALIZER_FALLBACK=true
 ```
 
-Install the Gradio UI simulation dependencies:
+## Running The UI
+
+Launch the Gradio simulation UI:
 
 ```bash
-uv pip install -e '.[dev,ui]'
+.venv/bin/python -m bruteforce_canvas.cli gradio-ui --host 127.0.0.1 --port 7860
 ```
 
-Install local ASR dependencies for the microphone prompt path:
+Launch the Gradio UI wired to backend runtime:
 
 ```bash
-uv pip install -e '.[dev,ui,asr]'
+export BC_GRADIO_MODE=runtime
+export BC_GENERATOR=bonsai-http
+export BC_BONSAI_HTTP_URL=http://127.0.0.1:7950
+export BC_DEVICE=cuda
+export BC_IQA_MODE=real
+export BC_VLM_MODE=real
+export BC_LLM_BASE_URL=https://your-json-llm.example/v1
+export BC_LLM_MODEL=your-json-model
+.venv/bin/python -m bruteforce_canvas.cli gradio-ui --mode runtime --host 127.0.0.1 --port 7860
 ```
 
-Install ML dependencies before real local inference:
+Runtime mode prewarms configured services when enabled, parses prompts through the backend prompt pipeline, prewarms generator/evaluator adapters during pre-run review, enqueues five-seed batches through `RunService`, persists records under `runtime/gradio_runs/<run_id>/events.jsonl`, and sends feedback through the backend feedback policy.
 
-```bash
-uv pip install -e '.[ml]'
-```
-
-For a real-model development environment with the UI, install all extras at once:
-
-```bash
-uv pip install -e '.[dev,ui,asr,ml]'
-```
-
-## Replay UI
+## Replay And Inspection
 
 Render a recorded run into an HTML workspace:
 
@@ -212,40 +453,40 @@ Start the event stream used by UI integrations:
 .venv/bin/python -m bruteforce_canvas.cli stream --run-id run_001 --port 8765
 ```
 
-Launch the Gradio simulation UI:
+Run a real generator smoke test when you need an explicit PNG artifact:
 
 ```bash
-.venv/bin/python -m bruteforce_canvas.cli gradio-ui --host 127.0.0.1 --port 7860
+.venv/bin/python -m bruteforce_canvas.cli bonsai-smoke --output-dir runtime/bonsai_smoke
 ```
 
-Launch the Gradio UI wired to the backend runtime:
-
-```bash
-export BC_GRADIO_MODE=runtime
-export BC_GENERATOR=bonsai-http
-export BC_BONSAI_HTTP_URL=http://127.0.0.1:7950
-export BC_BONSAI_HTTP_TOKEN=...
-export BC_DEVICE=cuda
-export BC_IQA_MODE=real
-export BC_VLM_MODE=real
-export BC_LLM_TIMEOUT_SECONDS=600
-.venv/bin/python -m bruteforce_canvas.cli gradio-ui --mode runtime --host 127.0.0.1 --port 7860
-```
-
-Runtime mode parses prompts through the configured LLM pipeline, prewarms the generator and evaluators during pre-run review, enqueues a backend five-seed sweep through `RunService`, persists JSONL records under `runtime/gradio_runs/<run_id>/events.jsonl`, and sends feedback through the same backend feedback policy as the replay UI. Use `BC_GENERATOR=bonsai-http` to call an already-running local Bonsai FastAPI backend; use `BC_GENERATOR=bonsai` only when the Gradio process itself should load the external Bonsai Python backend. Keep `BC_IQA_MODE=static` and `BC_VLM_MODE=static` only for UI wiring tests.
-
-Cache the Cohere Transcribe model before first microphone use:
+Cache the ASR model before first microphone use:
 
 ```bash
 .venv/bin/python -m bruteforce_canvas.cli cache-asr
 ```
 
-## Current Practical Notes
+## Testing
 
-The repository contains local adapters for JoyQuality, MiniCPM-V, and optional TRIBE v2. On a 16 GB Ampere GPU, run JoyQuality and MiniCPM-V side by side; keep TRIBE disabled unless a separate capacity check proves it fits with the generator and evaluators.
-
-Run focused verification after adapter or config changes:
+Run the full suite:
 
 ```bash
-.venv/bin/python -m pytest tests/test_app_config.py tests/test_app_factory.py tests/test_llm_clients.py tests/test_real_adapters.py -q
+.venv/bin/python -m pytest -q
 ```
+
+Run focused checks after adapter, config, or UI changes:
+
+```bash
+.venv/bin/python -m pytest tests/test_app_config.py tests/test_app_factory.py tests/test_llm_clients.py -q
+.venv/bin/python -m pytest tests/test_real_adapters.py -q
+.venv/bin/python -m pytest tests/test_gradio_ui.py -q
+```
+
+Real model tests are intentionally guarded. The normal suite should remain useful on machines without the full ML stack.
+
+## Practical Notes
+
+- Keep private model endpoints, tokens, and deployment-specific runtime values out of Git.
+- Keep the external generator backend outside this repository and point to it with environment variables.
+- Use static adapters for deterministic backend tests.
+- Use real adapters only in explicit runtime or real-model verification profiles.
+- Treat generated images, videos, audio, caches, and run logs as runtime artifacts unless there is a specific reason to version them.

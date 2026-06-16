@@ -11,6 +11,7 @@ from bruteforce_canvas.app_factory import (
     build_run_service,
     build_stage_plan,
     build_vlm_adapter,
+    prewarm_json_llm,
 )
 from bruteforce_canvas.canonicalizers import EmbeddingCanonicalizerAdapter, FallbackCanonicalizerAdapter
 from bruteforce_canvas.evaluation import StaticIQAAdapter, StaticVLMAdapter
@@ -115,6 +116,32 @@ def test_factory_builds_openai_compatible_server_json_client_from_config():
     assert client.max_completion_tokens == 2048
     assert client.temperature == 0.1
     assert client.structured_decoding is False
+
+
+def test_factory_prewarm_json_llm_runs_prompt_document_spec_dummy_inference(monkeypatch):
+    captured = {}
+
+    class FakeClient:
+        def generate_json(self, *, system: str, user: dict, schema_name: str) -> dict:
+            captured["system"] = system
+            captured["user"] = user
+            captured["schema_name"] = schema_name
+            return {"prewarm": "ok"}
+
+    def fake_build_json_llm_client(config: AppConfig) -> FakeClient:
+        captured["config"] = config
+        return FakeClient()
+
+    monkeypatch.setattr("bruteforce_canvas.app_factory.build_json_llm_client", fake_build_json_llm_client)
+
+    result = prewarm_json_llm(AppConfig(llm={"max_completion_tokens": 2048, "temperature": 0.7}))
+
+    assert result == {"prewarm": "ok"}
+    assert captured["schema_name"] == "PromptDocumentSpec"
+    assert "Warm up prompt extraction" in captured["system"]
+    assert "red ceramic cube" in captured["user"]["raw_prompt"]
+    assert captured["config"].llm.max_completion_tokens == 1024
+    assert captured["config"].llm.temperature == 0.0
 
 
 def test_factory_builds_local_minicpm_vlm_by_default():

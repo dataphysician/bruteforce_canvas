@@ -153,11 +153,8 @@ class JoyQualityAdapter:
             return
         self._model, self._processor, self._resolved_model_id, self._resolved_model_version = self._load_model()
         assert self._model is not None
-        self._resolved_device = self._resolve_device()
-        try:
-            self._model.to(self._resolved_device)
-        except Exception:
-            pass
+        requested_device = self._resolve_device()
+        self._move_model_to_device(requested_device)
         self._model.eval()
 
     def is_available(self) -> bool:
@@ -233,25 +230,28 @@ class JoyQualityAdapter:
         import torch  # local import; only needed in real mode
         from PIL import Image  # local import; only needed in real mode
 
-        device = self._resolved_device or self._resolve_device()
-        results: list[QualityEvaluation] = []
+        device = self._model_device(self._model, fallback=self._resolved_device or self._resolve_device())
+        self._resolved_device = device
+        images = []
         for path in paths:
             with Image.open(path) as raw:
-                image = raw.convert("RGB")
-            inputs = self._processor(images=image, return_tensors="pt")
-            inputs = {key: value.to(device) for key, value in inputs.items()}
-            with torch.no_grad():
-                logits = self._model(**inputs).logits
-            score = self._logit_to_score(logits)
-            results.append(
-                QualityEvaluation(
-                    score=score,
-                    model_id=self._resolved_model_id or JOYQUALITY_PRIMARY_MODEL_ID,
-                    model_version=self._resolved_model_version,
-                    confidence="high",
-                )
+                images.append(raw.convert("RGB"))
+
+        inputs = self._processor(images=images, return_tensors="pt")
+        inputs = self._move_tensor_mapping_to_device(inputs, device)
+        with torch.no_grad():
+            logits = self._model(**inputs).logits
+        scores = self._logits_to_scores(logits, expected_count=len(paths))
+
+        return [
+            QualityEvaluation(
+                score=score,
+                model_id=self._resolved_model_id or JOYQUALITY_PRIMARY_MODEL_ID,
+                model_version=self._resolved_model_version,
+                confidence="high",
             )
-        return results
+            for score in scores
+        ]
 
     @staticmethod
     def _logit_to_score(logits: Any) -> float:
@@ -269,15 +269,91 @@ class JoyQualityAdapter:
             return 0.5
         return float(min(max(probability, 1e-6), 1.0 - 1e-6))
 
+    @staticmethod
+    def _logits_to_scores(logits: Any, *, expected_count: int) -> list[float]:
+        """Map a batched classifier logit tensor to one score per image."""
+
+        if expected_count <= 0:
+            return []
+        if expected_count == 1:
+            return [JoyQualityAdapter._logit_to_score(logits)]
+
+        import torch  # local import; only needed in real mode
+
+        tensor = logits.float()
+        if tensor.ndim == 0 or int(tensor.shape[0]) != expected_count:
+            raise ValueError(
+                f"JoyQuality logit batch size mismatch: expected {expected_count}, got shape {tuple(tensor.shape)}"
+            )
+        per_image_logits = tensor.reshape(expected_count, -1).mean(dim=1)
+        probabilities = torch.sigmoid(per_image_logits).detach().cpu().tolist()
+        scores: list[float] = []
+        for probability in probabilities:
+            value = float(probability)
+            if math.isnan(value):
+                value = 0.5
+            scores.append(float(min(max(value, 1e-6), 1.0 - 1e-6)))
+        return scores
+
     def _resolve_device(self) -> str:
         if self.device == "cpu":
             return "cpu"
         try:
             import torch
 
-            return "cuda" if torch.cuda.is_available() else "cpu"
-        except Exception:
+            if torch.cuda.is_available():
+                return "cuda"
+            if self.device == "cuda":
+                raise RuntimeError("JoyQualityAdapter device='cuda' was requested, but CUDA is not available.")
             return "cpu"
+        except Exception as error:
+            if self.device == "cuda":
+                raise RuntimeError("JoyQualityAdapter device='cuda' was requested, but CUDA availability cannot be checked.") from error
+            return "cpu"
+
+    def _move_model_to_device(self, device: str) -> None:
+        assert self._model is not None
+        try:
+            moved_model = self._model.to(device)
+        except Exception as error:
+            if "out of memory" in str(error).lower() or error.__class__.__name__ == "OutOfMemoryError":
+                raise RuntimeError(
+                    f"JoyQuality model could not be moved to {device!r}: CUDA out of memory while loading IQA."
+                ) from error
+            raise RuntimeError(f"JoyQuality model could not be moved to {device!r}.") from error
+        if moved_model is not None:
+            self._model = moved_model
+        self._resolved_device = self._model_device(self._model, fallback=device)
+        if device.startswith("cuda") and not self._resolved_device.startswith("cuda"):
+            raise RuntimeError(
+                f"JoyQuality model remained on {self._resolved_device!r} after CUDA placement was requested."
+            )
+
+    @staticmethod
+    def _model_device(model: Any, *, fallback: str) -> str:
+        model_device = getattr(model, "device", None)
+        if model_device is not None:
+            return str(model_device)
+        for getter_name in ("parameters", "buffers"):
+            getter = getattr(model, getter_name, None)
+            if not callable(getter):
+                continue
+            try:
+                iterator = iter(getter())
+            except Exception:
+                continue
+            try:
+                tensor = next(iterator)
+            except StopIteration:
+                continue
+            tensor_device = getattr(tensor, "device", None)
+            if tensor_device is not None:
+                return str(tensor_device)
+        return fallback
+
+    @staticmethod
+    def _move_tensor_mapping_to_device(inputs: dict[str, Any], device: str) -> dict[str, Any]:
+        return {key: value.to(device) if hasattr(value, "to") else value for key, value in inputs.items()}
 
     def _load_model(self) -> tuple[Any, Any, str, str]:
         """Load the JoyQuality SigLIP2 IQA model and its processor.

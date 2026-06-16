@@ -175,6 +175,142 @@ def test_joyquality_real_prewarm_moves_model_to_resolved_device(monkeypatch: pyt
     assert adapter._resolved_device == "cuda"
 
 
+def test_joyquality_real_prewarm_records_actual_parameter_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeTensor:
+        def __init__(self) -> None:
+            self.device = "cpu"
+
+    class FakeModel:
+        def __init__(self) -> None:
+            self.param = FakeTensor()
+
+        def to(self, device: str) -> "FakeModel":
+            self.param.device = "cuda:0" if device == "cuda" else device
+            return self
+
+        def eval(self) -> None:
+            return None
+
+        def parameters(self) -> object:
+            return iter([self.param])
+
+    model = FakeModel()
+    adapter = JoyQualityAdapter(mode="real", device="cuda")
+
+    monkeypatch.setattr(adapter, "_load_model", lambda: (model, object(), JOYQUALITY_PRIMARY_MODEL_ID, "test"))
+    monkeypatch.setattr(adapter, "_resolve_device", lambda: "cuda")
+
+    adapter.prewarm()
+
+    assert adapter._resolved_device == "cuda:0"
+
+
+def test_joyquality_real_prewarm_does_not_hide_failed_device_move(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeModel:
+        def to(self, _device: str) -> "FakeModel":
+            raise RuntimeError("simulated placement failure")
+
+        def eval(self) -> None:
+            return None
+
+    adapter = JoyQualityAdapter(mode="real", device="cuda")
+
+    monkeypatch.setattr(adapter, "_load_model", lambda: (FakeModel(), object(), JOYQUALITY_PRIMARY_MODEL_ID, "test"))
+    monkeypatch.setattr(adapter, "_resolve_device", lambda: "cuda")
+
+    with pytest.raises(RuntimeError, match="JoyQuality model could not be moved to 'cuda'"):
+        adapter.prewarm()
+
+
+def test_joyquality_real_prewarm_reports_cuda_oom_during_device_move(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeModel:
+        def to(self, _device: str) -> "FakeModel":
+            raise RuntimeError("CUDA out of memory. Tried to allocate 20.00 MiB.")
+
+        def eval(self) -> None:
+            return None
+
+    adapter = JoyQualityAdapter(mode="real", device="cuda")
+
+    monkeypatch.setattr(adapter, "_load_model", lambda: (FakeModel(), object(), JOYQUALITY_PRIMARY_MODEL_ID, "test"))
+    monkeypatch.setattr(adapter, "_resolve_device", lambda: "cuda")
+
+    with pytest.raises(RuntimeError, match="CUDA out of memory while loading IQA"):
+        adapter.prewarm()
+
+
+def test_joyquality_iqa_inputs_move_to_actual_model_device() -> None:
+    class FakeTensor:
+        def __init__(self) -> None:
+            self.to_calls: list[str] = []
+
+        def to(self, device: str) -> "FakeTensor":
+            self.to_calls.append(device)
+            return self
+
+    pixel_values = FakeTensor()
+
+    moved = JoyQualityAdapter._move_tensor_mapping_to_device({"pixel_values": pixel_values, "metadata": "kept"}, "cuda:0")
+
+    assert moved["pixel_values"] is pixel_values
+    assert pixel_values.to_calls == ["cuda:0"]
+    assert moved["metadata"] == "kept"
+
+
+def test_joyquality_real_mode_scores_five_images_in_single_forward(tmp_path: Path) -> None:
+    torch = pytest.importorskip("torch")
+
+    paths: list[Path] = []
+    for index in range(5):
+        path = tmp_path / f"real_{index}.png"
+        Image.new("RGB", (32, 32), (40 * index, 80, 120)).save(path)
+        paths.append(path)
+
+    class FakeProcessor:
+        def __init__(self) -> None:
+            self.batch_sizes: list[int] = []
+
+        def __call__(self, *, images: object, return_tensors: str) -> dict[str, object]:
+            assert return_tensors == "pt"
+            assert isinstance(images, list)
+            self.batch_sizes.append(len(images))
+            return {"pixel_values": torch.zeros((len(images), 3, 16, 16))}
+
+    class FakeModel:
+        def __init__(self) -> None:
+            self.forward_calls = 0
+            self.seen_shape: tuple[int, ...] | None = None
+
+        def __call__(self, **inputs: object) -> object:
+            self.forward_calls += 1
+            pixel_values = inputs["pixel_values"]
+            self.seen_shape = tuple(pixel_values.shape)
+            return type("FakeOutput", (), {"logits": torch.tensor([[1.0], [0.0], [-1.0], [2.0], [-2.0]])})()
+
+    processor = FakeProcessor()
+    model = FakeModel()
+    adapter = JoyQualityAdapter(mode="real", device="cpu")
+    adapter._model = model
+    adapter._processor = processor
+    adapter._resolved_model_id = JOYQUALITY_PRIMARY_MODEL_ID
+    adapter._resolved_model_version = "test"
+    adapter._resolved_device = "cpu"
+
+    results = adapter.evaluate(paths)
+
+    assert processor.batch_sizes == [5]
+    assert model.forward_calls == 1
+    assert model.seen_shape == (5, 3, 16, 16)
+    assert [round(result.score, 3) for result in results] == [0.731, 0.5, 0.269, 0.881, 0.119]
+
+
+def test_joyquality_batched_logits_require_expected_batch_size() -> None:
+    torch = pytest.importorskip("torch")
+
+    with pytest.raises(ValueError, match="JoyQuality logit batch size mismatch"):
+        JoyQualityAdapter._logits_to_scores(torch.ones((1, 1)), expected_count=5)
+
+
 # ---------------------------------------------------------------------------
 # 3. Real mode — availability guard
 # ---------------------------------------------------------------------------

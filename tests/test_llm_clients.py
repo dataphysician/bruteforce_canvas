@@ -137,7 +137,7 @@ def test_openai_compatible_json_client_rejects_unknown_schema() -> None:
         client.generate_json(system="x", user={}, schema_name="UnknownSchema")
 
 
-def test_openai_compatible_json_client_default_timeout_allows_modal_cold_start() -> None:
+def test_openai_compatible_json_client_default_timeout_allows_cloud_gpu_cold_start() -> None:
     client = OpenAICompatibleServerJsonLLMClient(base_url=OPENAI_COMPATIBLE_SERVER_DEFAULT_BASE_URL)
 
     assert client.timeout_seconds == OPENAI_COMPATIBLE_SERVER_DEFAULT_TIMEOUT_SECONDS

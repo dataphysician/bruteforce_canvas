@@ -213,10 +213,29 @@ def _prepare_prompt_document_payload(payload: dict) -> dict:
 
 
 def _prepare_extraction_payload(payload: dict, *, raw_prompt: str) -> dict:
-    prepared = _prepare_prompt_document_payload(payload)
+    prepared = _prepare_prompt_document_payload(_wrap_graph_extraction_payload(payload))
     if isinstance(prepared, dict) and not prepared.get("raw_user_prompt"):
         prepared = {**prepared, "raw_user_prompt": raw_prompt}
     return prepared
+
+
+def _wrap_graph_extraction_payload(payload: dict) -> dict:
+    if not isinstance(payload, dict) or "graph" in payload:
+        return payload
+    keys = set(payload)
+    if not {"seed_prompt", "elements"}.issubset(keys):
+        return payload
+
+    graph_keys = {"seed_prompt", "elements", "relations"}
+    graph = {
+        "seed_prompt": payload["seed_prompt"],
+        "elements": payload["elements"],
+        "relations": payload.get("relations", []),
+    }
+    return {
+        **{key: value for key, value in payload.items() if key not in graph_keys},
+        "graph": graph,
+    }
 
 
 def _prepare_repair_document_payload(payload: dict, original: PromptDocumentSpec) -> dict:

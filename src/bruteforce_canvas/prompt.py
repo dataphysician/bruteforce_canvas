@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from enum import StrEnum
 from typing import TYPE_CHECKING, Literal
 
@@ -174,7 +175,122 @@ def __getattr__(name: str) -> object:
 def _clean_spec_text(value: object | None) -> str:
     if value is None:
         return ""
-    return str(value).strip()
+    return " ".join(str(value).strip().split())
+
+
+_PROMPT_COMMAND_PREFIX = re.compile(
+    r"^(?:generate|create|make|draw|show)\s+(?:(?:a|an)\s+)?(?:(?:clear|detailed)\s+)?"
+    r"(?:image|picture|photo|rendering)\s+of\s+",
+    re.IGNORECASE,
+)
+_RELATION_NEEDS_ARTICLE = re.compile(
+    r"\b(on top of|inside|under|over|next to|in front of|behind|on|in)\s+"
+    r"(?!a\b|an\b|the\b)([a-z][a-z0-9_-]*(?:\s+[a-z][a-z0-9_-]*){0,2})(?=,|$)",
+    re.IGNORECASE,
+)
+_TRAILING_FRAGMENT_PUNCTUATION = " \t\n\r,.;:"
+_SEMANTIC_DROP_TOKENS = {"a", "an", "the", "of"}
+_LEADING_ARTICLE_EXCLUSIONS = {
+    "a",
+    "an",
+    "the",
+    "no",
+    "two",
+    "three",
+    "four",
+    "five",
+    "several",
+    "multiple",
+    "many",
+    "group",
+}
+
+
+def _clean_prompt_fragment(value: object | None) -> str:
+    text = _clean_spec_text(value)
+    if not text:
+        return ""
+    text = re.sub(r"^generate\s+", "", text, flags=re.IGNORECASE)
+    text = _PROMPT_COMMAND_PREFIX.sub("", text)
+    return text.strip(_TRAILING_FRAGMENT_PUNCTUATION)
+
+
+def _semantic_tokens(value: object | None) -> list[str]:
+    tokens = [
+        token
+        for token in re.findall(r"[a-z0-9]+", _clean_prompt_fragment(value).lower())
+        if token not in _SEMANTIC_DROP_TOKENS
+    ]
+    deduped: list[str] = []
+    for token in tokens:
+        if deduped and deduped[-1] == token:
+            continue
+        deduped.append(token)
+    return deduped
+
+
+def _semantic_key(value: object | None) -> str:
+    return " ".join(_semantic_tokens(value))
+
+
+def _is_semantically_redundant(candidate: str, existing: list[str]) -> bool:
+    candidate_key = _semantic_key(candidate)
+    if not candidate_key:
+        return True
+    candidate_tokens = set(candidate_key.split())
+    for phrase in existing:
+        existing_key = _semantic_key(phrase)
+        if not existing_key:
+            continue
+        if candidate_key == existing_key or candidate_key in existing_key:
+            return True
+        existing_tokens = set(existing_key.split())
+        if candidate_tokens.issubset(existing_tokens):
+            return True
+        if existing_key in candidate_key and len(candidate_tokens) <= len(existing_tokens) + 1:
+            return True
+    return False
+
+
+def _append_scene_phrase(parts: list[str], value: object | None) -> None:
+    text = _clean_prompt_fragment(value)
+    if not text or _is_semantically_redundant(text, parts):
+        return
+    parts.append(text)
+
+
+def _lower_initial_article(value: str) -> str:
+    return re.sub(r"^(A|An|The)\b", lambda match: match.group(1).lower(), value, count=1)
+
+
+def _lower_initial_word(value: str) -> str:
+    match = re.match(r"([A-Z][a-z]+)(\b.*)", value)
+    if not match:
+        return value
+    return match.group(1).lower() + match.group(2)
+
+
+def _add_missing_relation_articles(value: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        relation = match.group(1)
+        target = match.group(2)
+        return f"{relation} a {target}"
+
+    return _RELATION_NEEDS_ARTICLE.sub(replace, value)
+
+
+def _add_missing_leading_article(value: str) -> str:
+    first = value.split(maxsplit=1)[0].strip(",.").lower() if value.split() else ""
+    if not first or first in _LEADING_ARTICLE_EXCLUSIONS:
+        return value
+    return f"a {value}"
+
+
+def _normalize_positive_prompt_text(value: str) -> str:
+    normalized = _lower_initial_article(value)
+    normalized = _lower_initial_word(normalized)
+    normalized = _add_missing_relation_articles(normalized)
+    return _add_missing_leading_article(normalized)
 
 
 def _display_spec_value(value: object | None) -> str:
@@ -211,9 +327,15 @@ def _spec_object_descriptor_map(document: PromptDocumentSpec) -> dict[str, list[
 
 def _spec_element_phrase(element: object, descriptors: list[object]) -> str:
     parts: list[str] = []
+    label = object_phrase(element)
+    label_tokens = set(_semantic_tokens(label))
     for descriptor in descriptors:
-        parts.extend(_spec_object_parts(descriptor))
-    _append_unique(parts, object_phrase(element))
+        for part in _spec_object_parts(descriptor):
+            part_tokens = set(_semantic_tokens(part))
+            if part_tokens and part_tokens.issubset(label_tokens):
+                continue
+            _append_unique(parts, part)
+    _append_unique(parts, label)
     return " ".join(parts)
 
 
@@ -224,7 +346,7 @@ def _spec_scene_phrases(document: PromptDocumentSpec) -> list[str]:
     relation_targets = {relation.target_id for relation in document.graph.relations}
     phrases: list[str] = []
 
-    _append_unique(phrases, document.graph.seed_prompt)
+    _append_scene_phrase(phrases, document.graph.seed_prompt)
 
     for element in document.graph.elements:
         if element.id in relation_targets and element.role != "primary_subject":
@@ -238,11 +360,11 @@ def _spec_scene_phrases(document: PromptDocumentSpec) -> list[str]:
             relation_raw = _clean_spec_text(relation.relation_raw)
             if relation_raw and target_phrase:
                 phrase = f"{phrase} {relation_raw} {target_phrase}".strip()
-        _append_unique(phrases, phrase)
+        _append_scene_phrase(phrases, phrase)
 
     for action in document.action_lane.actions:
         if action.support_status in {"supported", "inferred"}:
-            _append_unique(phrases, action.movement_raw)
+            _append_scene_phrase(phrases, action.movement_raw)
 
     return phrases
 
@@ -298,11 +420,14 @@ def compile_prompt(document: PromptDocumentSpec) -> str:
         composition_phrase(document),
         style_prompt(document),
     ]
-    positive = ", ".join(part for part in positive_parts if part)
+    positive = ", ".join(_clean_prompt_fragment(part) for part in positive_parts if _clean_prompt_fragment(part))
+    positive = _normalize_positive_prompt_text(positive)
     rendered = "Generate " + positive
     negative = negative_prompt(document)
     if negative:
-        rendered += ". Negative prompt: " + negative
+        rendered = rendered.rstrip(".") + ". Negative prompt: " + negative
+    elif not rendered.endswith("."):
+        rendered += "."
     return rendered
 
 

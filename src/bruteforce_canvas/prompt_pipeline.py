@@ -185,12 +185,18 @@ class PromptPipeline:
         repairer: RepairAdapter,
         *,
         max_repairs: int = 2,
+        max_semantic_repairs: int | None = None,
+        run_semantic_validation: bool = True,
+        run_verifier: bool = True,
     ) -> None:
         self.extractor = extractor
         self.canonicalizer = canonicalizer
         self.verifier = verifier
         self.repairer = repairer
         self.max_repairs = max_repairs
+        self.max_semantic_repairs = max_semantic_repairs
+        self.run_semantic_validation = run_semantic_validation
+        self.run_verifier = run_verifier
 
     def run_spec(self, raw_prompt: str) -> PromptPipelineSpecResult:
         extracted = self.extractor.extract(raw_prompt)
@@ -201,16 +207,48 @@ class PromptPipeline:
 
     def _run_spec_document(self, document: PromptDocumentSpec) -> PromptPipelineSpecResult:
         document = self._canonicalize_spec_document(document)
-        semantic_result = self._repair_semantic_validation_issues(document)
-        document = semantic_result.document
-        if semantic_result.issues:
-            report = _validation_report_from_issues(semantic_result.issues)
+        if self.run_semantic_validation:
+            semantic_result = self._repair_semantic_validation_issues(document)
+            document = semantic_result.document
+            if semantic_result.issues:
+                report = _validation_report_from_issues(semantic_result.issues)
+                document = document.model_copy(update={"verification": report})
+                return PromptPipelineSpecResult(
+                    approved=False,
+                    document=document,
+                    verifier_report=report,
+                    prompt_improvement_feedback=[issue.message for issue in semantic_result.issues],
+                )
+
+        if not self.run_verifier:
+            report = VerificationReport(approved=True, issues=[])
             document = document.model_copy(update={"verification": report})
+            try:
+                rendered = render_prompt_spec(document)
+            except Exception as error:
+                blocked = VerificationReport(
+                    approved=False,
+                    issues=[
+                        VerificationIssue(
+                            issue_type="render_failed",
+                            repair_scope="prompt_improvement",
+                            blocking=True,
+                            message=f"Compiled prompt could not render: {str(error)[:120]}",
+                        )
+                    ],
+                )
+                document = document.model_copy(update={"verification": blocked})
+                return PromptPipelineSpecResult(
+                    approved=False,
+                    document=document,
+                    verifier_report=blocked,
+                    prompt_improvement_feedback=[issue.message for issue in blocked.issues],
+                )
             return PromptPipelineSpecResult(
-                approved=False,
+                approved=True,
                 document=document,
                 verifier_report=report,
-                prompt_improvement_feedback=[issue.message for issue in semantic_result.issues],
+                rendered_prompt=rendered,
             )
 
         report = self.verifier.verify(document)
@@ -249,7 +287,8 @@ class PromptPipeline:
         while issues:
             retry_scope = issues[0].retry_scope
             attempts_used = attempts_by_scope.get(retry_scope, 0)
-            if attempts_used >= _retry_limit(retry_scope):
+            retry_limit = _retry_limit(retry_scope) if self.max_semantic_repairs is None else self.max_semantic_repairs
+            if attempts_used >= retry_limit:
                 return _SemanticValidationResult(document=document, issues=issues)
 
             retry_request = _retry_request(document, issues)

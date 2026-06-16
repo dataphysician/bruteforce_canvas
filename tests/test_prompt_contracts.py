@@ -69,8 +69,83 @@ def test_prompt_document_preserves_raw_relation_and_renders_generate_prompt():
     rendered = render_prompt_spec(document)
     assert rendered.rendered_prompt.startswith("Generate ")
     assert "red ceramic bowl" in rendered.rendered_prompt
-    assert "on wooden table" in rendered.rendered_prompt
+    assert "on a wooden table" in rendered.rendered_prompt
     assert document.graph.relations[0].relation_raw == "on"
+
+
+def test_prompt_render_collapses_seed_object_and_relation_duplicates():
+    document = PromptDocumentSpec(
+        raw_user_prompt="Green ball on top of bench",
+        graph=SceneGraphDraft(
+            seed_prompt="A green ball on top of a bench.",
+            elements=[
+                Element(
+                    id="object_01",
+                    label="green ball on top of bench",
+                    entity_type=EntityType.PRODUCT,
+                    role=ElementRole.PRIMARY_SUBJECT,
+                    importance=Importance.REQUIRED,
+                    evidence=EvidenceSpan(text="green ball", category=EvidenceCategory.EXPLICIT),
+                ),
+                Element(
+                    id="object_02",
+                    label="bench",
+                    entity_type=EntityType.FURNITURE,
+                    role=ElementRole.SUPPORTING,
+                    importance=Importance.REQUIRED,
+                    evidence=EvidenceSpan(text="bench", category=EvidenceCategory.EXPLICIT),
+                ),
+                Element(
+                    id="object_03",
+                    label="on top of",
+                    entity_type=EntityType.PRODUCT,
+                    role=ElementRole.SUPPORTING,
+                    importance=Importance.UNRESOLVED,
+                    evidence=EvidenceSpan(text="on top of", category=EvidenceCategory.EXPLICIT),
+                ),
+            ],
+            relations=[
+                RelationDescriptor(
+                    id="rel_01",
+                    source_id="object_01",
+                    target_id="object_02",
+                    relation_raw="on top of",
+                    evidence=EvidenceSpan(text="on top of", category=EvidenceCategory.EXPLICIT),
+                )
+            ],
+        ),
+        object_lane=ObjectLane(objects=[ObjectDescriptor(target_id="object_01", color="green")]),
+    )
+
+    rendered = render_prompt_spec(document)
+
+    assert rendered.rendered_prompt == "Generate a green ball on top of a bench."
+    assert "., " not in rendered.rendered_prompt
+    assert rendered.rendered_prompt.count("bench") == 1
+    assert rendered.rendered_prompt.count("on top of") == 1
+
+
+def test_prompt_render_normalizes_sparse_modal_seed_prompt():
+    document = PromptDocumentSpec(
+        raw_user_prompt="Green ball on top of bench",
+        graph=SceneGraphDraft(
+            seed_prompt="Green ball on top of bench",
+            elements=[
+                Element(
+                    id="object_01",
+                    label="Green ball on top of bench",
+                    entity_type=EntityType.PRODUCT,
+                    role=ElementRole.PRIMARY_SUBJECT,
+                    importance=Importance.REQUIRED,
+                    evidence=EvidenceSpan(text="Green ball on top of bench", category=EvidenceCategory.EXPLICIT),
+                )
+            ],
+        ),
+    )
+
+    rendered = render_prompt_spec(document)
+
+    assert rendered.rendered_prompt == "Generate a green ball on top of a bench."
 
 
 def test_prompt_document_rejects_missing_relation_endpoint():

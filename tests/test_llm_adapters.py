@@ -108,6 +108,59 @@ def test_llm_extraction_adapter_restores_raw_prompt_when_payload_omits_it():
     assert result.raw_user_prompt == "a ceramic bowl on a wooden table"
 
 
+def test_llm_extraction_adapter_wraps_root_level_graph_payload_from_modal():
+    client = FakeJsonClient(
+        [
+            {
+                "seed_prompt": "A green ball on a bench.",
+                "elements": [
+                    {
+                        "id": "e_10",
+                        "label": "green ball",
+                        "entity_type": "product",
+                        "role": "primary_subject",
+                        "importance": "required",
+                        "evidence": {"text": "green ball", "category": "explicit", "reason": "raw_prompt"},
+                    },
+                    {
+                        "id": "e_11",
+                        "label": "bench",
+                        "entity_type": "furniture",
+                        "role": "supporting",
+                        "importance": "required",
+                        "evidence": {"text": "bench", "category": "explicit", "reason": "raw_prompt"},
+                    },
+                ],
+                "relations": [
+                    {
+                        "id": "rel_12",
+                        "source_id": "e_10",
+                        "target_id": "e_11",
+                        "relation_raw": "on",
+                        "relation_match": {
+                            "raw": "on",
+                            "enum_value": "ON_TOP_OF",
+                            "confidence": "clear",
+                            "reason": "LLM prefilled a canonical field",
+                        },
+                        "importance": "required",
+                        "evidence": {"text": "on", "category": "explicit", "reason": "raw_prompt"},
+                    }
+                ],
+                "verification": {"approved": True, "issues": []},
+            }
+        ]
+    )
+
+    result = LLMPromptExtractionAdapter(client).extract("A green ball on a bench.")
+
+    assert result.raw_user_prompt == "A green ball on a bench."
+    assert result.graph.seed_prompt == "A green ball on a bench."
+    assert [element.id for element in result.graph.elements] == ["e_10", "e_11"]
+    assert result.graph.relations[0].id == "rel_12"
+    assert result.graph.relations[0].relation_match is None
+
+
 def test_llm_extraction_adapter_retries_invalid_prompt_document_payload():
     valid_payload = prompt_document_payload()
     client = FakeJsonClient(

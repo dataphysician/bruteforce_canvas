@@ -63,6 +63,10 @@ class RunService:
     def state(self) -> RunRuntimeState:
         return self._state
 
+    @property
+    def stop_requested(self) -> bool:
+        return self._stop_requested
+
     def snapshot(self) -> RuntimeSnapshot:
         return RuntimeSnapshot(
             state=self._state,
@@ -339,9 +343,12 @@ class RunService:
         )
 
     def _gate_generation_input(self) -> list[CandidateRecord] | None:
+        if not self._pending:
+            return None
+        coordinate_id = self._pending[0].coordinate_id
         candidates: list[CandidateRecord] = []
         for record in self.store.replay():
-            if record.record_type == "candidate_record":
+            if record.record_type == "candidate_record" and record.coordinate_id == coordinate_id:
                 try:
                     candidates.append(CandidateRecord.model_validate(record.payload))
                 except Exception:
@@ -349,9 +356,12 @@ class RunService:
         return candidates if candidates else None
 
     def _gate_evaluation_input(self) -> list[ImageEvaluationResult] | None:
+        if not self._pending:
+            return None
+        coordinate_id = self._pending[0].coordinate_id
         results: list[ImageEvaluationResult] = []
         for record in self.store.replay():
-            if record.record_type == "image_evaluation":
+            if record.record_type == "image_evaluation" and record.coordinate_id == coordinate_id:
                 try:
                     results.append(ImageEvaluationResult.model_validate(record.payload))
                 except Exception:
