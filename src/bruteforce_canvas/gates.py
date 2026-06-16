@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from bruteforce_canvas.evaluation import ImageEvaluationResult
 from bruteforce_canvas.generation import MIN_SEED_BUNDLE_SIZE, CandidateRecord
-from bruteforce_canvas.prompt import PromptDocument, RenderedPrompt
+from bruteforce_canvas.prompt import RenderedPrompt
 from bruteforce_canvas.prompt_models import PromptDocumentSpec
 from bruteforce_canvas.router import CandidateCoordinateBatch
 
@@ -13,9 +13,9 @@ class GateError(ValueError):
 
 class StageGate:
     @staticmethod
-    def prompt(document: PromptDocument | PromptDocumentSpec) -> PromptDocument | PromptDocumentSpec:
+    def prompt(document: PromptDocumentSpec) -> PromptDocumentSpec:
         if not document.verification.approved or any(issue.blocking for issue in document.verification.issues):
-            raise GateError("PromptDocument verification did not pass")
+            raise GateError("prompt verification did not pass")
         return document
 
     @staticmethod

@@ -24,22 +24,30 @@ on machines without the ML stack.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import math
+import os
 import re
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Literal
 
 from bruteforce_canvas.evaluation import AlignmentEvaluation, ImpactEvaluation, QualityEvaluation
+from bruteforce_canvas.llm_clients import (
+    OPENAI_COMPATIBLE_SERVER_DEFAULT_TIMEOUT_SECONDS,
+    _chat_completions_url,
+    _choice_message_content,
+    _parse_json_object,
+    _post_json,
+)
 from bruteforce_canvas.prompt import EvaluationTargetManifest
 
 
 # Spec 04 §6.1 / §20: JoyQuality SigLIP2 SO400M is the reference IQA
 # encoder.
 JOYQUALITY_PRIMARY_MODEL_ID = "fancyfeast/joyquality-siglip2-so400m-512-16-05k047vn"
-JOYQUALITY_PROCESSOR_MODEL_ID = "google/siglip2-so400m-patch16-512"
 
 # Spec 04 / Phase G: MiniCPM-V 4.6 is the reference open-source VLM
 # used for the alignment evaluator. The adapter below wraps it
@@ -57,14 +65,16 @@ TRIBE_V2_MODEL_ID: str = "Jessylg27/tribev2-lite-qv"
 # Default model version string used when the loaded checkpoint does not
 # expose one via the transformers config.
 _DEFAULT_MODEL_VERSION = "1"
+_JOYQUALITY_IMAGE_SIZE = 512
+_MINICPM_DOWNSAMPLE_MODE = "16x"
+_MINICPM_MAX_NEW_TOKENS = 128
 
 
 def _static_score_for_path(image_path: Path) -> float:
     """Deterministic, hash-derived score in [0, 1] for a given path.
 
-    Used by the static mode and as a graceful fallback when the real
-    model is unreachable. The score is stable across processes because
-    it is derived from a SHA-256 of the absolute path.
+    Used by static mode only. The score is stable across processes
+    because it is derived from a SHA-256 of the absolute path.
     """
 
     digest = hashlib.sha256(str(image_path).encode("utf-8")).digest()
@@ -80,7 +90,7 @@ class JoyQualityAdapter:
 
     ``"static"`` (default — no heavy deps required)
         Returns deterministic, hash-derived scores in ``[0, 1]`` without
-        loading any model. Useful for unit tests, CI, and the legacy
+        loading any model. Useful for unit tests, CI, and the lightweight
         ``StaticIQAAdapter`` contract.
 
     ``"real"``
@@ -185,22 +195,17 @@ class JoyQualityAdapter:
 
         In ``static`` mode the score is a deterministic function of the
         image path (SHA-256 → ``[0, 1]``). In ``real`` mode the score
-        is the model's sigmoid-normalized quality logit; if the model
-        cannot be reached the adapter falls back to the static path
-        rather than raising, so the evaluator pipeline stays robust.
+        is the primary JoyQuality model's sigmoid-normalized quality
+        logit. Real-mode load or inference failures raise so IQA
+        positive/negative datasets are never mixed with fallback model
+        output.
         """
 
         paths = [Path(image) for image in images]
         if self.mode == "static":
             return [self._static_evaluation(path) for path in paths]
 
-        try:
-            return self._evaluate_real(paths)
-        except Exception:
-            # Defensive fallback: a model load / inference failure must
-            # not crash the batch — degrade to deterministic scores so
-            # the orchestrator can still record a result.
-            return [self._static_evaluation(path) for path in paths]
+        return self._evaluate_real(paths)
 
     # ------------------------------------------------------------------
     # Internals
@@ -281,7 +286,7 @@ class JoyQualityAdapter:
         """
 
         try:
-            from transformers import AutoImageProcessor, AutoModelForImageClassification, AutoProcessor
+            from transformers import AutoModelForImageClassification
         except Exception as error:  # pragma: no cover - exercised only with deps
             raise RuntimeError(
                 "transformers is required for JoyQualityAdapter in 'real' mode; "
@@ -289,9 +294,51 @@ class JoyQualityAdapter:
             ) from error
 
         model = AutoModelForImageClassification.from_pretrained(JOYQUALITY_PRIMARY_MODEL_ID)
-        processor = _load_joyquality_processor(AutoProcessor, AutoImageProcessor)
+        processor = JoyQualityImageProcessor.from_model_config(model)
         version = _extract_model_version(model)
         return model, processor, JOYQUALITY_PRIMARY_MODEL_ID, version
+
+
+class JoyQualityImageProcessor:
+    """Image tensor preparation for the JoyQuality checkpoint.
+
+    The JoyQuality repository currently ships model weights and config,
+    but no Hugging Face processor files. This processor is part of the
+    JoyQuality adapter contract rather than a substitute model: it only
+    prepares pixels for the JoyQuality checkpoint and does not provide
+    alternate IQA behavior.
+    """
+
+    def __init__(self, *, size: int = _JOYQUALITY_IMAGE_SIZE) -> None:
+        self.size = size
+
+    @classmethod
+    def from_model_config(cls, model: Any) -> "JoyQualityImageProcessor":
+        config = getattr(model, "config", None)
+        vision_config = getattr(config, "vision_config", None)
+        image_size = getattr(vision_config, "image_size", _JOYQUALITY_IMAGE_SIZE)
+        return cls(size=int(image_size or _JOYQUALITY_IMAGE_SIZE))
+
+    def __call__(self, *, images: Any, return_tensors: str = "pt") -> dict[str, Any]:
+        if return_tensors != "pt":
+            raise ValueError("JoyQualityImageProcessor only supports return_tensors='pt'")
+        try:
+            import torch
+            from PIL import Image
+        except Exception as error:  # pragma: no cover - depends on optional deps
+            raise RuntimeError("torch and Pillow are required for JoyQuality image preprocessing") from error
+
+        pil_images = images if isinstance(images, list) else [images]
+        tensors = []
+        for image in pil_images:
+            if not isinstance(image, Image.Image):
+                raise TypeError("JoyQualityImageProcessor expects PIL.Image inputs")
+            resized = image.convert("RGB").resize((self.size, self.size), Image.Resampling.BICUBIC)
+            data = torch.frombuffer(bytearray(resized.tobytes()), dtype=torch.uint8)
+            tensor = data.view(self.size, self.size, 3).permute(2, 0, 1).float().div(255.0)
+            tensor = tensor.sub(0.5).div(0.5)
+            tensors.append(tensor)
+        return {"pixel_values": torch.stack(tensors)}
 
 
 def _extract_model_version(model: Any) -> str:
@@ -306,24 +353,6 @@ def _extract_model_version(model: Any) -> str:
     if id_label:
         return str(id_label)
     return _DEFAULT_MODEL_VERSION
-
-
-def _load_joyquality_processor(auto_processor: Any, auto_image_processor: Any) -> Any:
-    """Load the image processor for JoyQuality classifier weights.
-
-    The JoyQuality checkpoint contains the classifier config and
-    weights, but no processor files. The matching SigLIP2 base checkpoint
-    ships the required ``preprocessor_config.json``.
-    """
-
-    last_error: Exception | None = None
-    for loader in (auto_processor, auto_image_processor):
-        for model_id in (JOYQUALITY_PRIMARY_MODEL_ID, JOYQUALITY_PROCESSOR_MODEL_ID):
-            try:
-                return loader.from_pretrained(model_id)
-            except Exception as error:  # pragma: no cover - depends on HF cache/network
-                last_error = error
-    raise RuntimeError("could not load JoyQuality image processor") from last_error
 
 
 def _static_alignment_score(
@@ -358,8 +387,7 @@ def _parse_alignment_from_response(response: Any) -> float | None:
     """Best-effort extraction of a float score from a MiniCPM-V response.
 
     Returns ``None`` if the response does not contain a parseable score;
-    callers should fall back to a deterministic static score in that
-    case so a malformed model reply never crashes the batch.
+    real-mode callers treat that as an inference failure.
     """
 
     if isinstance(response, (int, float)):
@@ -388,6 +416,12 @@ def _parse_alignment_from_response(response: Any) -> float | None:
         except ValueError:
             return None
     return None
+
+
+def _import_transformers_module() -> Any:
+    import transformers
+
+    return transformers
 
 
 class MiniCPMVAdapter:
@@ -426,6 +460,7 @@ class MiniCPMVAdapter:
         self.mode = mode
         self.device = device
         self._model: Any | None = None
+        self._processor: Any | None = None
         self._tokenizer: Any | None = None
         self._resolved_device: str | None = None
 
@@ -446,9 +481,10 @@ class MiniCPMVAdapter:
             return
         if self._model is not None:
             return
-        model, tokenizer, resolved = self._load_model()
+        model, processor, resolved = self._load_model()
         self._model = model
-        self._tokenizer = tokenizer
+        self._processor = processor
+        self._tokenizer = processor
         self._resolved_device = resolved
 
     def is_available(self) -> bool:
@@ -492,8 +528,8 @@ class MiniCPMVAdapter:
         per input image. In ``static`` mode the score is a deterministic
         function of the image path, prompt, and manifest signature. In
         ``real`` mode the prewarmed MiniCPM-V model is asked to score
-        the image; a malformed response falls back to the deterministic
-        static score so the batch never crashes.
+        the image; a malformed response raises so failed inference is
+        visible to the caller.
         """
 
         if not isinstance(images, list):
@@ -511,13 +547,7 @@ class MiniCPMVAdapter:
         if self.mode == "static":
             return [self._static_evaluation(path, prompt, manifest) for path in paths]
 
-        try:
-            return self._evaluate_real(paths, prompt, manifest)
-        except Exception:
-            # Defensive fallback: a model load / inference failure must
-            # not crash the batch — degrade to deterministic scores so
-            # the orchestrator can still record a result.
-            return [self._static_evaluation(path, prompt, manifest) for path in paths]
+        return self._evaluate_real(paths, prompt, manifest)
 
     # ------------------------------------------------------------------
     # Internals
@@ -588,41 +618,68 @@ class MiniCPMVAdapter:
         """Run a single image through MiniCPM-V and extract a score."""
 
         assert self._model is not None
-        try:
-            with pil_image_module.open(path) as raw:
-                image = raw.convert("RGB")
-        except Exception:
-            return _static_alignment_score(path, prompt, manifest)
+        with pil_image_module.open(path) as raw:
+            image = raw.convert("RGB")
 
-        response: Any
-        try:
-            response = self._model.chat(
-                image=image,
-                msgs=[{"role": "user", "content": question}],
-                tokenizer=self._tokenizer,
-            )
-        except TypeError:
-            try:
-                response = self._model.chat(image, question, self._tokenizer)
-            except Exception:
-                return _static_alignment_score(path, prompt, manifest)
-        except Exception:
-            return _static_alignment_score(path, prompt, manifest)
+        response = self._generate_alignment_response(image, question)
 
         parsed = _parse_alignment_from_response(response)
         if parsed is None:
-            return _static_alignment_score(path, prompt, manifest)
+            raise RuntimeError("MiniCPM-V response did not contain a parseable alignment score")
         return min(max(parsed, 1e-6), 1.0 - 1e-6)
+
+    def _generate_alignment_response(self, image: Any, question: str) -> str:
+        assert self._model is not None
+        assert self._processor is not None
+
+        import torch
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": question},
+                ],
+            }
+        ]
+        inputs = self._processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt",
+            downsample_mode=_MINICPM_DOWNSAMPLE_MODE,
+            max_slice_nums=36,
+        )
+        device = getattr(self._model, "device", self._resolved_device or "cpu")
+        inputs = inputs.to(device)
+        with torch.no_grad():
+            generated_ids = self._model.generate(
+                **inputs,
+                downsample_mode=_MINICPM_DOWNSAMPLE_MODE,
+                max_new_tokens=_MINICPM_MAX_NEW_TOKENS,
+            )
+        generated_ids_trimmed = [
+            output_ids[len(input_ids) :]
+            for input_ids, output_ids in zip(inputs.input_ids, generated_ids, strict=True)
+        ]
+        output_text = self._processor.batch_decode(
+            generated_ids_trimmed,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+        return str(output_text[0])
 
     def _load_model(self) -> tuple[Any, Any, str]:
         """Lazy-import torch/transformers and load MiniCPM-V.
 
-        Returns a 3-tuple ``(model, tokenizer, resolved_device)``.
+        Returns a 3-tuple ``(model, processor, resolved_device)``.
         """
 
         try:
             import torch
-            from transformers import AutoModel, AutoTokenizer
+            transformers = _import_transformers_module()
         except Exception as error:  # pragma: no cover - exercised only with deps
             raise RuntimeError(
                 "MiniCPMVAdapter in 'real' mode requires 'torch' and 'transformers'; "
@@ -630,19 +687,24 @@ class MiniCPMVAdapter:
             ) from error
 
         resolved = self._resolve_device(torch)
-        torch_dtype = torch.float16 if resolved.startswith("cuda") else None
-        load_kwargs: dict[str, Any] = {"trust_remote_code": True}
-        if torch_dtype is not None:
-            load_kwargs["torch_dtype"] = torch_dtype
-
-        model = AutoModel.from_pretrained(MINICPM_V_MODEL_ID, **load_kwargs)
+        torch_dtype = torch.float16 if resolved.startswith("cuda") else "auto"
+        processor = transformers.AutoProcessor.from_pretrained(MINICPM_V_MODEL_ID, trust_remote_code=True)
+        model_kwargs = {
+            "torch_dtype": torch_dtype,
+            "trust_remote_code": True,
+        }
+        try:
+            model = transformers.AutoModelForImageTextToText.from_pretrained(MINICPM_V_MODEL_ID, **model_kwargs)
+        except ValueError as error:
+            if "minicpmv4_6" not in str(error) and "does not recognize this architecture" not in str(error):
+                raise
+            model = transformers.AutoModel.from_pretrained(MINICPM_V_MODEL_ID, **model_kwargs)
         try:
             model = model.to(resolved)
         except Exception:
             pass
         model.eval()
-        tokenizer = AutoTokenizer.from_pretrained(MINICPM_V_MODEL_ID, trust_remote_code=True)
-        return model, tokenizer, resolved
+        return model, processor, resolved
 
     def _resolve_device(self, torch_mod: Any) -> str:
         if self.device == "cpu":
@@ -654,6 +716,162 @@ class MiniCPMVAdapter:
             resolved = "cuda" if cuda_available else "cpu"
         self._resolved_device = resolved
         return resolved
+
+
+class OpenAICompatibleVLMAlignmentAdapter:
+    """OpenAI-compatible multimodal endpoint adapter for VLM alignment.
+
+    This adapter is intentionally separate from the prompt-LLM adapter.
+    It is for image-prompt alignment services that expose an OpenAI-style
+    ``/v1/chat/completions`` endpoint with image input support.
+    """
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        model: str,
+        api_key: str | None = None,
+        timeout_seconds: float = OPENAI_COMPATIBLE_SERVER_DEFAULT_TIMEOUT_SECONDS,
+        max_completion_tokens: int = 512,
+        temperature: float = 0.0,
+        structured_decoding: bool = True,
+    ) -> None:
+        if not base_url.strip():
+            raise ValueError("vlm base_url must not be empty")
+        if not model.strip():
+            raise ValueError("vlm model must not be empty")
+        self.base_url = base_url
+        self.model = model
+        self.api_key = api_key
+        self.timeout_seconds = timeout_seconds
+        self.max_completion_tokens = max_completion_tokens
+        self.temperature = temperature
+        self.structured_decoding = structured_decoding
+
+    def prewarm(self) -> None:
+        return None
+
+    def is_available(self) -> bool:
+        return True
+
+    def evaluate(
+        self,
+        images: Sequence[str | Path],
+        prompt: str,
+        manifest: EvaluationTargetManifest,
+    ) -> list[AlignmentEvaluation]:
+        if not isinstance(images, list):
+            raise TypeError(f"images must be a list, got {type(images).__name__}")
+        if not isinstance(prompt, str):
+            raise TypeError(f"prompt must be a str, got {type(prompt).__name__}")
+        if not isinstance(manifest, EvaluationTargetManifest):
+            raise TypeError(
+                f"manifest must be an EvaluationTargetManifest, got {type(manifest).__name__}"
+            )
+        return [self._evaluate_one(Path(image), prompt, manifest) for image in images]
+
+    def _evaluate_one(
+        self,
+        image_path: Path,
+        prompt: str,
+        manifest: EvaluationTargetManifest,
+    ) -> AlignmentEvaluation:
+        payload = {
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Score whether the image aligns with the prompt and target manifest. "
+                        "Return only JSON with a score from 0 to 1 and a short reason."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": _alignment_question(prompt, manifest),
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": _image_data_url(image_path)},
+                        },
+                    ],
+                },
+            ],
+            "temperature": self.temperature,
+            "max_completion_tokens": self.max_completion_tokens,
+            "response_format": _alignment_response_format(structured=self.structured_decoding),
+        }
+        response = _post_json(
+            _chat_completions_url(self.base_url),
+            payload,
+            api_key=self.api_key or os.environ.get("BC_VLM_API_KEY"),
+            timeout_seconds=self.timeout_seconds,
+        )
+        content = _choice_message_content(response)
+        parsed = _parse_json_object(content)
+        score = _alignment_score_from_json(parsed)
+        return AlignmentEvaluation(
+            score=score,
+            model_id=self.model,
+            model_version="openai-compatible-vlm",
+            confidence="high",
+        )
+
+
+def _alignment_question(prompt: str, manifest: EvaluationTargetManifest) -> str:
+    targets = "; ".join(
+        f"{target.target_id}: {target.label or target.value_raw or target.relation_raw or target.target_kind}"
+        for target in manifest.targets
+    ) or "no explicit targets"
+    negative_targets = "; ".join(
+        f"{target.target_id}: {target.label or target.value_raw or target.relation_raw or target.target_kind}"
+        for target in manifest.negative_targets
+    ) or "none"
+    return (
+        f"Prompt: {prompt}\n"
+        f"Required targets: {targets}\n"
+        f"Negative targets: {negative_targets}\n"
+        'Respond as {"score": <float 0..1>, "reason": "<short reason>"} only.'
+    )
+
+
+def _image_data_url(path: Path) -> str:
+    data = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:image/png;base64,{data}"
+
+
+def _alignment_response_format(*, structured: bool) -> dict[str, Any]:
+    if not structured:
+        return {"type": "json_object"}
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "AlignmentScore",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "score": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                    "reason": {"type": "string"},
+                },
+                "required": ["score", "reason"],
+            },
+        },
+    }
+
+
+def _alignment_score_from_json(value: object) -> float:
+    if not isinstance(value, dict):
+        raise RuntimeError("VLM alignment response must be a JSON object")
+    score = value.get("score")
+    if isinstance(score, int | float):
+        return min(max(float(score), 1e-6), 1.0 - 1e-6)
+    raise RuntimeError("VLM alignment response did not contain numeric score")
 
 
 class TRIBEv2Adapter:
@@ -854,7 +1072,7 @@ class TRIBEv2Adapter:
 __all__ = [
     "JoyQualityAdapter",
     "JOYQUALITY_PRIMARY_MODEL_ID",
-    "JOYQUALITY_PROCESSOR_MODEL_ID",
+    "OpenAICompatibleVLMAlignmentAdapter",
     "MiniCPMVAdapter",
     "MINICPM_V_MODEL_ID",
     "TRIBEv2Adapter",

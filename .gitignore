@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.venv/
 .coverage
 htmlcov/
 dist/
@@ -15,8 +16,8 @@ build/
 *.p8
 runtime/
 .local/
+.cache/
 .DS_Store
-specs/
 .~lock.*#
 .#*
 *.md.lock

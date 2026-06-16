@@ -16,13 +16,7 @@ from bruteforce_canvas.learning import LearningEvent, LearningState, apply_coord
 from bruteforce_canvas.locking import apply_lock_overrides, build_default_lock_config
 from bruteforce_canvas.orchestration import CandidateState, RunConfig, apply_evaluation_disposition
 from bruteforce_canvas.persistence import PersistenceRecord
-from bruteforce_canvas.prompt import (
-    PromptDocument,
-    render_prompt,
-    render_prompt_spec,
-    target_manifest_from_prompt,
-    target_manifest_from_prompt_spec,
-)
+from bruteforce_canvas.prompt import render_prompt_spec, target_manifest_from_prompt_spec
 from bruteforce_canvas.prompt_models import PromptDocumentSpec
 from bruteforce_canvas.router import AxisDomain, FieldState, LHSRouter, RouterInput, ThompsonArmState
 from bruteforce_canvas.shared import StrictModel
@@ -48,16 +42,12 @@ class InMemoryRunEngine:
         self,
         *,
         run_id: str,
-        document: PromptDocument | PromptDocumentSpec,
+        document: PromptDocumentSpec,
         quality_scores: list[float],
         alignment_scores: list[float],
     ) -> RunOnceResult:
-        prompt_document_id = getattr(document, "prompt_document_id", "doc_001")
-        raw_user_prompt = (
-            document.raw_user_prompt or document.graph.seed_prompt
-            if isinstance(document, PromptDocumentSpec)
-            else document.raw_user_prompt
-        )
+        prompt_document_id = document.prompt_document_id
+        raw_user_prompt = document.raw_user_prompt or document.graph.seed_prompt
         config = RunConfig(run_id=run_id, raw_user_prompt=raw_user_prompt)
         persisted: list[PersistenceRecord] = [
             PersistenceRecord(
@@ -80,12 +70,8 @@ class InMemoryRunEngine:
             )
             return RunOnceResult(persisted_records=persisted)
 
-        if isinstance(document, PromptDocumentSpec):
-            rendered = render_prompt_spec(document)
-            manifest = target_manifest_from_prompt_spec(document)
-        else:
-            rendered = render_prompt(document)
-            manifest = target_manifest_from_prompt(run_id, rendered, document)
+        rendered = render_prompt_spec(document)
+        manifest = target_manifest_from_prompt_spec(document)
         default_lock_config = build_default_lock_config(document)
         effective_lock_config = apply_lock_overrides(default_lock_config, [])
         persisted.extend(

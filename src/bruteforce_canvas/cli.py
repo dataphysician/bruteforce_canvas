@@ -399,6 +399,21 @@ def main(argv: list[str] | None = None) -> int:
     stream.add_argument("--run-id", required=True)
     stream.add_argument("--seed-test-event", action="store_true")
     stream.add_argument("--port", type=int, default=DEFAULT_STREAM_PORT)
+    gradio_ui = subparsers.add_parser("gradio-ui")
+    gradio_ui.add_argument("--host", default=None)
+    gradio_ui.add_argument("--port", type=int, default=None)
+    gradio_ui.add_argument("--share", action="store_true")
+    gradio_ui.add_argument("--mode", choices=["simulation", "runtime"], default=None)
+    cache_asr = subparsers.add_parser("cache-asr")
+    cache_asr.add_argument("--model-id", default=None)
+    cache_asr.add_argument("--cache-dir", default=None)
+    cache_asr.add_argument("--local-files-only", action="store_true")
+    bonsai_smoke = subparsers.add_parser("bonsai-smoke")
+    bonsai_smoke.add_argument("--output-dir", default=None)
+    bonsai_smoke.add_argument("--steps", type=int, default=4)
+    bonsai_smoke.add_argument("--height", type=int, default=512)
+    bonsai_smoke.add_argument("--width", type=int, default=512)
+    bonsai_smoke.add_argument("--prompt", default="Generate a ceramic bowl on wooden table")
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
@@ -409,6 +424,46 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "stream":
         return _run_stream_command(args.run_id, seed_test_event=args.seed_test_event, port=args.port)
+    if args.command == "gradio-ui":
+        from bruteforce_canvas.gradio_ui import launch
+
+        launch(server_name=args.host, server_port=args.port, share=args.share, mode=args.mode)
+        return 0
+    if args.command == "cache-asr":
+        from bruteforce_canvas.asr import ASRConfig, cache_asr_weights
+
+        config = ASRConfig.from_env()
+        path = cache_asr_weights(
+            config.model_copy(
+                update={
+                    "model_id": args.model_id or config.model_id,
+                    "cache_dir": args.cache_dir or config.cache_dir,
+                    "local_files_only": bool(args.local_files_only),
+                }
+            )
+        )
+        print(path)
+        return 0
+    if args.command == "bonsai-smoke":
+        from bruteforce_canvas.app_config import GeneratorKind, load_app_config
+        from bruteforce_canvas.app_factory import build_generator_adapter
+        from bruteforce_canvas.generation import BonsaiTernaryAdapter
+
+        config = load_app_config()
+        if config.generator.kind != GeneratorKind.BONSAI.value:
+            raise ValueError("bonsai-smoke requires BC_GENERATOR=bonsai")
+        adapter = build_generator_adapter(config)
+        if not isinstance(adapter, BonsaiTernaryAdapter):
+            raise RuntimeError("bonsai-smoke did not build a BonsaiTernaryAdapter")
+        result = adapter.smoke_test(
+            output_dir=Path(args.output_dir) if args.output_dir else None,
+            prompt=args.prompt,
+            steps=args.steps,
+            height=args.height,
+            width=args.width,
+        )
+        print(result.model_dump_json())
+        return 0
     return 2
 
 

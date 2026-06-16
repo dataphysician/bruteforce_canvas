@@ -21,9 +21,10 @@ from bruteforce_canvas.orchestration import (
     RuntimeSnapshot,
     apply_candidate_feedback,
     build_stall_diagnostic,
+    stall_guard_decision,
 )
 from bruteforce_canvas.persistence import PERSISTENCE_VERSION, JsonlEventStore, PersistenceRecord, reconstruct_run_state
-from bruteforce_canvas.prompt import PromptDocument, RenderedPrompt
+from bruteforce_canvas.prompt import RenderedPrompt
 from bruteforce_canvas.prompt_models import PromptDocumentSpec
 from bruteforce_canvas.router import CandidateCoordinateBatch
 from bruteforce_canvas.shared import FeedbackAction
@@ -77,6 +78,25 @@ class RunService:
 
     def request_stop(self) -> None:
         self._stop_requested = True
+
+    def stop_with_reason(self, reason: str, *, details: dict[str, Any] | None = None) -> LoopDecision:
+        decision = LoopDecision(action=LoopAction.STOP, reason=reason, next_state=RunRuntimeState.STOPPED)
+        self._state = RunRuntimeState.STOPPED
+        self._persist_transition(decision, details=details)
+        self._publish_event(event_type="state_changed", message=reason, state=self._state)
+        return decision
+
+    def stop_for_stall_guard_if_needed(self) -> LoopDecision | None:
+        counters = self._counters_from_store()
+        stall = stall_guard_decision(self.config, counters)
+        if not stall.stop:
+            return None
+        decision = LoopDecision(action=LoopAction.STOP, reason=stall.reason, next_state=RunRuntimeState.STOPPED)
+        self._state = RunRuntimeState.STOPPED
+        self._persist_transition(decision, details=stall.details)
+        self._persist_stall_diagnostic(counters)
+        self._publish_event(event_type="state_changed", message=stall.reason, state=self._state)
+        return decision
 
     def request_pause(self) -> None:
         if self._state != RunRuntimeState.STOPPED:
@@ -294,16 +314,13 @@ class RunService:
                 )
         return None
 
-    def _gate_prompt_input(self) -> PromptDocument | PromptDocumentSpec | None:
+    def _gate_prompt_input(self) -> PromptDocumentSpec | None:
         for record in reversed(self.store.replay()):
             if record.record_type == "prompt_document":
                 try:
-                    return PromptDocument.model_validate(record.payload)
+                    return PromptDocumentSpec.model_validate(record.payload)
                 except Exception:
-                    try:
-                        return PromptDocumentSpec.model_validate(record.payload)
-                    except Exception:
-                        return None
+                    return None
         return None
 
     def _gate_router_input(self) -> CandidateCoordinateBatch | None:
@@ -393,18 +410,21 @@ class RunService:
             confidence="low",
         )
 
-    def _persist_transition(self, decision: LoopDecision) -> None:
+    def _persist_transition(self, decision: LoopDecision, *, details: dict[str, Any] | None = None) -> None:
         self._transition_counter += 1
+        payload = {
+            "action": str(decision.action),
+            "reason": decision.reason,
+            "next_state": str(decision.next_state),
+        }
+        if details:
+            payload["details"] = details
         self.store.append(
             PersistenceRecord(
                 record_id=f"loop_transition:{self._transition_counter}",
                 record_type="loop_transition",
                 run_id=self.config.run_id,
-                payload={
-                    "action": str(decision.action),
-                    "reason": decision.reason,
-                    "next_state": str(decision.next_state),
-                },
+                payload=payload,
             )
         )
 

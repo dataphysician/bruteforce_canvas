@@ -17,19 +17,20 @@ import sys
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 from bruteforce_canvas import real_adapters
 from bruteforce_canvas.evaluation import AlignmentEvaluation, ImpactEvaluation, QualityEvaluation
 from bruteforce_canvas.prompt import EvaluationTarget, EvaluationTargetManifest
 from bruteforce_canvas.real_adapters import (
     JOYQUALITY_PRIMARY_MODEL_ID,
-    JOYQUALITY_PROCESSOR_MODEL_ID,
     MINICPM_V_MODEL_ID,
     TRIBE_V2_MODEL_ID,
+    JoyQualityImageProcessor,
     JoyQualityAdapter,
     MiniCPMVAdapter,
+    OpenAICompatibleVLMAlignmentAdapter,
     TRIBEv2Adapter,
-    _load_joyquality_processor,
 )
 
 
@@ -40,6 +41,12 @@ def _fake_image_paths(tmp_path: Path, count: int) -> list[Path]:
         path.write_bytes(b"fake-png")
         paths.append(path)
     return paths
+
+
+def _real_png_path(tmp_path: Path) -> Path:
+    path = tmp_path / "real.png"
+    Image.new("RGB", (32, 32), (180, 30, 30)).save(path)
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -168,29 +175,6 @@ def test_joyquality_real_prewarm_moves_model_to_resolved_device(monkeypatch: pyt
     assert adapter._resolved_device == "cuda"
 
 
-def test_joyquality_processor_loader_falls_back_to_siglip2_base_processor() -> None:
-    class Loader:
-        def __init__(self, name: str, available_model_id: str | None = None) -> None:
-            self.name = name
-            self.available_model_id = available_model_id
-            self.calls: list[str] = []
-
-        def from_pretrained(self, model_id: str) -> str:
-            self.calls.append(model_id)
-            if model_id != self.available_model_id:
-                raise OSError(f"{model_id} missing processor")
-            return f"{self.name}:{model_id}"
-
-    auto_processor = Loader("processor")
-    auto_image_processor = Loader("image_processor", JOYQUALITY_PROCESSOR_MODEL_ID)
-
-    processor = _load_joyquality_processor(auto_processor, auto_image_processor)
-
-    assert processor == f"image_processor:{JOYQUALITY_PROCESSOR_MODEL_ID}"
-    assert auto_processor.calls == [JOYQUALITY_PRIMARY_MODEL_ID, JOYQUALITY_PROCESSOR_MODEL_ID]
-    assert auto_image_processor.calls == [JOYQUALITY_PRIMARY_MODEL_ID, JOYQUALITY_PROCESSOR_MODEL_ID]
-
-
 # ---------------------------------------------------------------------------
 # 3. Real mode — availability guard
 # ---------------------------------------------------------------------------
@@ -227,20 +211,15 @@ def test_joyquality_model_id_constants_match_spec() -> None:
     """The primary model id matches the documented reference."""
 
     assert JOYQUALITY_PRIMARY_MODEL_ID == "fancyfeast/joyquality-siglip2-so400m-512-16-05k047vn"
-    assert JOYQUALITY_PROCESSOR_MODEL_ID == "google/siglip2-so400m-patch16-512"
 
 
 # ---------------------------------------------------------------------------
-# 5. Defensive fallback — real mode that fails still returns a result
+# 5. Real IQA provenance — no static/model/processor fallback in real mode
 # ---------------------------------------------------------------------------
-def test_joyquality_real_mode_falls_back_to_static_when_model_missing(
+def test_joyquality_real_mode_raises_when_primary_model_load_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A failing model load must degrade to deterministic scores, not raise.
-
-    We simulate a broken ``from_pretrained`` call so the real-mode
-    branch falls into the catch-all and produces a static result list.
-    """
+    """A failing real IQA load must not degrade to static/fallback scores."""
 
     pytest.importorskip("torch")
     pytest.importorskip("transformers")
@@ -248,23 +227,52 @@ def test_joyquality_real_mode_falls_back_to_static_when_model_missing(
     def _explode(*_args: object, **_kwargs: object) -> None:
         raise RuntimeError("simulated network failure")
 
-    # Patch the auto-loader used by the adapter; both primary and
-    # fallback attempts will raise, exercising the inner ``except``.
-    from transformers import AutoModelForImageClassification, AutoProcessor
+    from transformers import AutoModelForImageClassification
 
     monkeypatch.setattr(AutoModelForImageClassification, "from_pretrained", _explode)
-    monkeypatch.setattr(AutoProcessor, "from_pretrained", _explode)
 
     adapter = JoyQualityAdapter(mode="real", device="cpu")
     paths = _fake_image_paths(tmp_path, 2)
-    results = adapter.evaluate(paths)
 
-    assert len(results) == 2
-    for evaluation in results:
-        assert isinstance(evaluation, QualityEvaluation)
-        # Static-fallback path uses the deterministic model id.
-        assert evaluation.model_id == "static-joyquality"
-        assert 0.0 < evaluation.score < 1.0
+    with pytest.raises(RuntimeError, match="simulated network failure"):
+        adapter.evaluate(paths)
+
+
+def test_joyquality_real_mode_uses_only_primary_model_and_internal_processor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeVisionConfig:
+        image_size = 384
+
+    class FakeConfig:
+        vision_config = FakeVisionConfig()
+
+    class FakeModel:
+        config = FakeConfig()
+
+        def to(self, _device: str) -> "FakeModel":
+            return self
+
+        def eval(self) -> None:
+            return None
+
+    class FakeModelLoader:
+        calls: list[str] = []
+
+        @classmethod
+        def from_pretrained(cls, model_id: str) -> FakeModel:
+            cls.calls.append(model_id)
+            return FakeModel()
+
+    monkeypatch.setattr("transformers.AutoModelForImageClassification", FakeModelLoader)
+
+    adapter = JoyQualityAdapter(mode="real", device="cpu")
+    adapter.prewarm()
+
+    assert FakeModelLoader.calls == [JOYQUALITY_PRIMARY_MODEL_ID]
+    assert isinstance(adapter._processor, JoyQualityImageProcessor)
+    assert adapter._processor.size == 384
+    assert adapter._resolved_model_id == JOYQUALITY_PRIMARY_MODEL_ID
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +397,145 @@ def test_minicpmv_static_prewarm_is_noop(tmp_path: Path) -> None:
     assert isinstance(results[0], AlignmentEvaluation)
 
 
+def test_minicpmv_real_mode_uses_image_text_to_text_generate(tmp_path: Path) -> None:
+    class FakeInputs(dict):
+        input_ids = [[1, 2]]
+
+        def to(self, device: str) -> "FakeInputs":
+            self["device"] = device
+            return self
+
+    class FakeProcessor:
+        def __init__(self) -> None:
+            self.messages = None
+            self.decoded = None
+
+        def apply_chat_template(self, messages, **kwargs):
+            self.messages = messages
+            self.kwargs = kwargs
+            return FakeInputs(input_ids=self.__class__.input_ids if hasattr(self.__class__, "input_ids") else [[1, 2]])
+
+        def batch_decode(self, generated_ids, **kwargs):
+            self.decoded = generated_ids
+            return ['{"score": 0.73, "reason": "visible cup"}']
+
+    class FakeModel:
+        device = "cuda"
+
+        def __init__(self) -> None:
+            self.generate_kwargs = None
+
+        def generate(self, **kwargs):
+            self.generate_kwargs = kwargs
+            return [[1, 2, 3, 4]]
+
+    processor = FakeProcessor()
+    model = FakeModel()
+    adapter = MiniCPMVAdapter(mode="real", device="cuda")
+    adapter._model = model
+    adapter._processor = processor
+    adapter._tokenizer = processor
+    adapter._resolved_device = "cuda"
+
+    result = adapter.evaluate([_real_png_path(tmp_path)], "red cup", _sample_manifest())[0]
+
+    assert result.score == 0.73
+    assert processor.messages[0]["content"][0]["type"] == "image"
+    assert processor.messages[0]["content"][1]["type"] == "text"
+    assert model.generate_kwargs["downsample_mode"] == "16x"
+    assert model.generate_kwargs["max_new_tokens"] == 128
+
+
+def test_minicpmv_load_model_falls_back_to_auto_model_for_remote_code_architecture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("torch")
+
+    calls: dict[str, object] = {}
+
+    class FakeProcessorFactory:
+        @staticmethod
+        def from_pretrained(model_id: str, **kwargs: object) -> object:
+            calls["processor_model_id"] = model_id
+            calls["processor_kwargs"] = kwargs
+            return object()
+
+    class BrokenImageTextToTextFactory:
+        @staticmethod
+        def from_pretrained(model_id: str, **kwargs: object) -> object:
+            calls["image_text_to_text_model_id"] = model_id
+            calls["image_text_to_text_kwargs"] = kwargs
+            raise ValueError("Transformers does not recognize model type `minicpmv4_6`")
+
+    class FakeModel:
+        def __init__(self) -> None:
+            self.device = None
+            self.eval_called = False
+
+        def to(self, device: str) -> "FakeModel":
+            self.device = device
+            return self
+
+        def eval(self) -> None:
+            self.eval_called = True
+
+    class FallbackAutoModelFactory:
+        @staticmethod
+        def from_pretrained(model_id: str, **kwargs: object) -> FakeModel:
+            calls["fallback_model_id"] = model_id
+            calls["fallback_kwargs"] = kwargs
+            return FakeModel()
+
+    class FakeTransformers:
+        AutoProcessor = FakeProcessorFactory
+        AutoModelForImageTextToText = BrokenImageTextToTextFactory
+        AutoModel = FallbackAutoModelFactory
+
+    monkeypatch.setattr(real_adapters, "_import_transformers_module", lambda: FakeTransformers)
+
+    adapter = MiniCPMVAdapter(mode="real", device="cpu")
+    model, processor, resolved = adapter._load_model()
+
+    assert calls["image_text_to_text_model_id"] == MINICPM_V_MODEL_ID
+    assert calls["fallback_model_id"] == MINICPM_V_MODEL_ID
+    assert calls["processor_model_id"] == MINICPM_V_MODEL_ID
+    assert calls["fallback_kwargs"]["trust_remote_code"] is True
+    assert model.device == "cpu"
+    assert model.eval_called is True
+    assert processor is not None
+    assert resolved == "cpu"
+
+
+def test_minicpmv_real_mode_raises_on_malformed_model_response(tmp_path: Path) -> None:
+    class FakeInputs(dict):
+        input_ids = [[1, 2]]
+
+        def to(self, _device: str) -> "FakeInputs":
+            return self
+
+    class FakeProcessor:
+        def apply_chat_template(self, *_args, **_kwargs):
+            return FakeInputs(input_ids=[[1, 2]])
+
+        def batch_decode(self, *_args, **_kwargs):
+            return ["no numeric score"]
+
+    class FakeModel:
+        device = "cpu"
+
+        def generate(self, **_kwargs):
+            return [[1, 2, 3]]
+
+    adapter = MiniCPMVAdapter(mode="real", device="cpu")
+    adapter._model = FakeModel()
+    adapter._processor = FakeProcessor()
+    adapter._tokenizer = adapter._processor
+    adapter._resolved_device = "cpu"
+
+    with pytest.raises(RuntimeError, match="parseable alignment score"):
+        adapter.evaluate([_real_png_path(tmp_path)], "red cup", _sample_manifest())
+
+
 def test_minicpmv_real_mode_rejects_invalid_arguments() -> None:
     """The constructor validates ``mode`` and ``device`` literals."""
 
@@ -419,6 +566,43 @@ def test_minicpmv_evaluate_empty_images_returns_empty_list() -> None:
     adapter = MiniCPMVAdapter(mode="static")
     results = adapter.evaluate([], prompt="x", manifest=_sample_manifest())
     assert results == []
+
+
+def test_openai_compatible_vlm_alignment_adapter_posts_multimodal_structured_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_post_json(url: str, payload: dict, *, api_key: str | None, timeout_seconds: float) -> dict:
+        captured["url"] = url
+        captured["payload"] = payload
+        captured["api_key"] = api_key
+        captured["timeout_seconds"] = timeout_seconds
+        return {"choices": [{"message": {"content": '{"score": 0.81, "reason": "aligned"}'}}]}
+
+    monkeypatch.setattr("bruteforce_canvas.real_adapters._post_json", fake_post_json)
+    image_path = _real_png_path(tmp_path)
+    adapter = OpenAICompatibleVLMAlignmentAdapter(
+        base_url="https://vlm.example.test/v1",
+        model="remote-minicpm",
+        api_key="secret",
+        timeout_seconds=11,
+    )
+
+    result = adapter.evaluate([image_path], "red cup", _sample_manifest())[0]
+
+    assert result.score == 0.81
+    assert captured["url"] == "https://vlm.example.test/v1/chat/completions"
+    assert captured["api_key"] == "secret"
+    assert captured["timeout_seconds"] == 11
+    payload = captured["payload"]
+    assert payload["model"] == "remote-minicpm"
+    assert payload["response_format"]["type"] == "json_schema"
+    content = payload["messages"][1]["content"]
+    assert content[0]["type"] == "text"
+    assert content[1]["type"] == "image_url"
+    assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
 
 
 # ---------------------------------------------------------------------------

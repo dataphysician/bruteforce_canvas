@@ -2,23 +2,87 @@ from __future__ import annotations
 
 from typing import Any
 
-from bruteforce_canvas.app_config import AppConfig
+from bruteforce_canvas.app_config import AppConfig, CanonicalizerProvider, GeneratorKind, LLMProvider, VLMProvider
+from bruteforce_canvas.canonicalizers import (
+    EmbeddingCanonicalizerAdapter,
+    FallbackCanonicalizerAdapter,
+    default_embedding_enum_contexts,
+)
 from bruteforce_canvas.evaluation import EvaluationPlan, StaticIQAAdapter, StaticImpactAdapter, StaticVLMAdapter
-from bruteforce_canvas.generation import BonsaiTernaryAdapter, BonsaiTernaryConfig, StubGeneratorAdapter
+from bruteforce_canvas.generation import BonsaiHttpAdapter, BonsaiTernaryAdapter, StubGeneratorAdapter
 from bruteforce_canvas.generator_registry import GENERATOR_REGISTRY
+from bruteforce_canvas.llm_adapters import (
+    LLMCanonicalizerAdapter,
+    LLMPromptExtractionAdapter,
+    LLMRepairAdapter,
+    LLMVerificationAdapter,
+)
+from bruteforce_canvas.llm_clients import OpenAICompatibleServerJsonLLMClient
 from bruteforce_canvas.persistence import JsonlEventStore
+from bruteforce_canvas.prompt_pipeline import PromptPipeline
+from bruteforce_canvas.real_adapters import MiniCPMVAdapter, OpenAICompatibleVLMAlignmentAdapter
 from bruteforce_canvas.run_service import RunService
 from bruteforce_canvas.scheduler import EvaluatorStagePlan, plan_evaluator_stages
 from bruteforce_canvas.worker import PersistentSeedSweepWorker
 
 
-def build_generator_adapter(config: AppConfig) -> StubGeneratorAdapter | BonsaiTernaryAdapter:
+def build_generator_adapter(config: AppConfig) -> StubGeneratorAdapter | BonsaiTernaryAdapter | BonsaiHttpAdapter:
     factory = GENERATOR_REGISTRY.get(config.generator.kind, GENERATOR_REGISTRY["stub"])
     return factory(config)
 
 
 def build_event_store(config: AppConfig) -> JsonlEventStore:
     return JsonlEventStore(config.event_store_path)
+
+
+def build_json_llm_client(config: AppConfig) -> OpenAICompatibleServerJsonLLMClient:
+    if config.llm.provider != LLMProvider.OPENAI_COMPATIBLE_SERVER.value:
+        raise ValueError(f"unsupported llm provider: {config.llm.provider}")
+    return OpenAICompatibleServerJsonLLMClient(
+        base_url=config.llm.base_url,
+        model=config.llm.model,
+        api_key=config.llm.api_key,
+        timeout_seconds=config.llm.timeout_seconds,
+        max_completion_tokens=config.llm.max_completion_tokens,
+        temperature=config.llm.temperature,
+        structured_decoding=config.llm.structured_decoding,
+    )
+
+
+def build_canonicalizer_adapter(
+    config: AppConfig,
+    *,
+    fallback_client: OpenAICompatibleServerJsonLLMClient | None = None,
+) -> object:
+    enum_contexts = default_embedding_enum_contexts()
+    llm_fallback = LLMCanonicalizerAdapter(
+        fallback_client or build_json_llm_client(config),
+        enum_contexts=enum_contexts,
+    )
+    if config.canonicalizer.provider == CanonicalizerProvider.LLM.value:
+        return llm_fallback
+    if config.canonicalizer.provider != CanonicalizerProvider.EMBEDDING.value:
+        raise ValueError(f"unsupported canonicalizer provider: {config.canonicalizer.provider}")
+
+    embedding = EmbeddingCanonicalizerAdapter(
+        model_id=config.canonicalizer.embedding_model,
+        device=config.device.device,
+        match_threshold=config.canonicalizer.match_threshold,
+        enum_contexts=enum_contexts,
+    )
+    if config.canonicalizer.llm_fallback:
+        return FallbackCanonicalizerAdapter(embedding, llm_fallback)
+    return embedding
+
+
+def build_prompt_pipeline(config: AppConfig) -> PromptPipeline:
+    client = build_json_llm_client(config)
+    return PromptPipeline(
+        LLMPromptExtractionAdapter(client),
+        build_canonicalizer_adapter(config, fallback_client=client),
+        LLMVerificationAdapter(client),
+        LLMRepairAdapter(client),
+    )
 
 
 def build_stage_plan(config: AppConfig) -> EvaluatorStagePlan:
@@ -36,6 +100,22 @@ def build_evaluation_plan(config: AppConfig) -> EvaluationPlan:
     )
 
 
+def build_vlm_adapter(config: AppConfig) -> MiniCPMVAdapter | OpenAICompatibleVLMAlignmentAdapter:
+    if config.vlm.provider == VLMProvider.LOCAL_MINICPM.value:
+        return MiniCPMVAdapter(mode="real", device=config.device.device)
+    if config.vlm.provider == VLMProvider.OPENAI_COMPATIBLE_SERVER.value:
+        return OpenAICompatibleVLMAlignmentAdapter(
+            base_url=config.vlm.base_url,
+            model=config.vlm.model,
+            api_key=config.vlm.api_key,
+            timeout_seconds=config.vlm.timeout_seconds,
+            max_completion_tokens=config.vlm.max_completion_tokens,
+            temperature=config.vlm.temperature,
+            structured_decoding=config.vlm.structured_decoding,
+        )
+    raise ValueError(f"unsupported vlm provider: {config.vlm.provider}")
+
+
 def build_run_service(
     config: AppConfig,
     *,
@@ -44,9 +124,12 @@ def build_run_service(
     impact: StaticImpactAdapter | None = None,
 ) -> RunService:
     store = build_event_store(config)
+    generator = build_generator_adapter(config)
+    if config.device.prewarm or config.generator.kind in {GeneratorKind.BONSAI.value, GeneratorKind.BONSAI_HTTP.value}:
+        prewarm_all(generator=generator, iqa=iqa, vlm=vlm, impact=impact)
     worker = PersistentSeedSweepWorker(
         store=store,
-        generator=build_generator_adapter(config),
+        generator=generator,
         iqa=iqa,
         vlm=vlm,
         impact=impact,

@@ -22,11 +22,8 @@ the bottom of ``prompt.py``:
     SceneGraphDraft, ObjectLane, ActionLane, CinematographyLane,
     ConstraintLane, PromptDocumentSpec, PromptBundle
 
-The new ``Element`` / ``CinematographyLane`` / ``ObjectDescriptor`` /
-``ActionDescriptor`` classes intentionally shadow the legacy versions in
-``prompt.py`` once re-exported. The legacy classes remain in ``prompt.py``
-for backward compatibility until B5 completes the migration; they are no
-longer reachable via the bare module name.
+The prompt domain is spec-only; the older pre-spec shape and its
+render/manifest compatibility path have been removed.
 
 Structural-only validators are implemented here. Semantic validators
 (Phase C) are deliberately out of scope.

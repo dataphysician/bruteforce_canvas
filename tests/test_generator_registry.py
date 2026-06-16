@@ -6,7 +6,7 @@ import pytest
 
 from bruteforce_canvas.app_config import AppConfig, GeneratorConfig
 from bruteforce_canvas.app_factory import build_generator_adapter
-from bruteforce_canvas.generation import BonsaiTernaryAdapter, StubGeneratorAdapter
+from bruteforce_canvas.generation import BonsaiHttpAdapter, BonsaiTernaryAdapter, StubGeneratorAdapter
 from bruteforce_canvas.generator_registry import (
     BUILDER_INCLUDES,
     GENERATOR_REGISTRY,
@@ -46,13 +46,30 @@ def test_bonsai_factory_works(tmp_path: Path) -> None:
     config = AppConfig(
         generator=GeneratorConfig(
             kind="bonsai",
+            bonsai_backend_root=tmp_path / "Bonsai-Image-Demo",
             bonsai_model_root=tmp_path / "bonsai",
             bonsai_triton_cache_dir=tmp_path / ".triton",
-        )
+        ),
+        device={"device": "cuda"},
     )
     adapter = build_generator_adapter(config)
     assert isinstance(adapter, BonsaiTernaryAdapter)
+    assert adapter.config.backend_root == tmp_path / "Bonsai-Image-Demo"
     assert adapter.config.model_root == tmp_path / "bonsai"
+
+
+def test_bonsai_http_factory_works() -> None:
+    config = AppConfig(
+        generator=GeneratorConfig(
+            kind="bonsai-http",
+            bonsai_http_url="http://127.0.0.1:7950",
+        )
+    )
+
+    adapter = build_generator_adapter(config)
+
+    assert isinstance(adapter, BonsaiHttpAdapter)
+    assert adapter.config.base_url == "http://127.0.0.1:7950"
 
 
 def test_custom_external_registration_works() -> None:

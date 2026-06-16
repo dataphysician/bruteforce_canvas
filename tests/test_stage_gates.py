@@ -92,7 +92,7 @@ def image_result(seed: int) -> ImageEvaluationResult:
 
 
 def test_prompt_gate_blocks_unapproved_or_blocking_documents():
-    with pytest.raises(GateError, match="PromptDocument verification did not pass"):
+    with pytest.raises(GateError, match="prompt verification did not pass"):
         StageGate.prompt(blocked_document())
 
 

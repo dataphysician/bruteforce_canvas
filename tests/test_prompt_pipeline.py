@@ -3,7 +3,6 @@ from bruteforce_canvas.prompt import (
     EvidenceCategory,
     EvidenceSpan,
     ObjectLane,
-    PromptDocument,
     PromptDocumentSpec,
     SceneGraphDraft,
     VerificationIssue,
@@ -91,7 +90,7 @@ class RecordingVerifier(VerificationAdapter):
         self.reports = reports
         self.calls = 0
 
-    def verify(self, document: PromptDocument | PromptDocumentSpec) -> VerificationReport:
+    def verify(self, document: PromptDocumentSpec) -> VerificationReport:
         report = self.reports[min(self.calls, len(self.reports) - 1)]
         self.calls += 1
         return report
@@ -103,13 +102,11 @@ class RecordingRepairer(RepairAdapter):
 
     def repair(
         self,
-        document: PromptDocument | PromptDocumentSpec,
+        document: PromptDocumentSpec,
         issue: RetryRequest | VerificationIssue,
-    ) -> PromptDocument | PromptDocumentSpec:
+    ) -> PromptDocumentSpec:
         repair_scope = issue.issues[0].retry_scope if isinstance(issue, RetryRequest) else issue.repair_scope
         self.scopes.append(repair_scope)
-        if not isinstance(document, PromptDocumentSpec):
-            return document
         if repair_scope == "object_descriptor":
             repaired = [
                 descriptor.model_copy(update={"material": None})

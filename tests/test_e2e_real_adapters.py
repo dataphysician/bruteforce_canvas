@@ -16,7 +16,6 @@ from bruteforce_canvas.prompt import (
     CanonicalEnum,
     EvidenceCategory,
     EvidenceSpan,
-    PromptDocument,
     VerificationIssue,
     VerificationReport,
     target_manifest_from_prompt_spec,
@@ -68,7 +67,7 @@ class _Canonicalizer:
 
 
 class _Verifier:
-    def verify(self, document: PromptDocument | PromptDocumentSpec) -> VerificationReport:
+    def verify(self, document: PromptDocumentSpec) -> VerificationReport:
         _ = document
         return VerificationReport(approved=True, issues=[])
 
@@ -76,9 +75,9 @@ class _Verifier:
 class _Repairer:
     def repair(
         self,
-        document: PromptDocument | PromptDocumentSpec,
+        document: PromptDocumentSpec,
         issue: RetryRequest | VerificationIssue,
-    ) -> PromptDocument | PromptDocumentSpec:
+    ) -> PromptDocumentSpec:
         _ = issue
         return document
 

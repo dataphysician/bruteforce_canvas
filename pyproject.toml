@@ -3,14 +3,34 @@ name = "bruteforce-canvas"
 version = "0.1.0"
 description = "Spec-compliant (00-06) greenfield implementation of the Bruteforce Canvas PRD contracts"
 requires-python = ">=3.12"
+license = "CC-BY-NC-4.0"
 dependencies = [
-  "pydantic>=2.13",
+  "pydantic>=2.11.10,<3",
 ]
 
 [project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "pytest-asyncio>=0.23",
+]
+ui = [
+  "gradio>=6.15.2",
+  "pillow>=10.0",
+]
+asr = [
+  "accelerate>=0.25",
+  "huggingface_hub>=0.23",
+  "librosa>=0.10",
+  "protobuf>=3.20",
+  "sentencepiece>=0.1.99",
+  "soundfile>=0.12",
+  "torch>=2.0",
+  "transformers>=5.7.0",
+]
 ml = [
   "torch>=2.0",
-  "transformers>=4.40",
+  "torchvision>=0.15",
+  "transformers>=5.7.0",
   "safetensors>=0.4",
   "accelerate>=0.25",
   "sentencepiece>=0.1.99",

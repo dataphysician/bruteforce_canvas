@@ -1,0 +1,14 @@
+pydantic>=2.11.10,<=2.12.5
+pillow>=10.0
+accelerate>=0.25
+huggingface_hub>=0.30
+librosa>=0.10
+protobuf>=3.20
+sentencepiece>=0.1.99
+soundfile>=0.12
+torch>=2.12
+torchvision>=0.15
+transformers>=5.12.1
+safetensors>=0.4
+gpytorch>=1.11
+pynvml>=0.2
