@@ -329,6 +329,11 @@ def test_workflow_accordion_uses_mermaid_markdown_and_requested_terms():
     assert '"htmlLabels": false' in WORKFLOW_MERMAID_MARKDOWN
     assert "classDef step" in WORKFLOW_MERMAID_MARKDOWN
     assert "Mellum2 Thinking 12B" in WORKFLOW_MERMAID_MARKDOWN
+    assert "Cohere Transcribe" in WORKFLOW_MERMAID_MARKDOWN
+    assert "BGE enum canonicalizer" in WORKFLOW_MERMAID_MARKDOWN
+    assert "Bonsai Ternary 4B" in WORKFLOW_MERMAID_MARKDOWN
+    assert "MiniCPM-V-4.6" in WORKFLOW_MERMAID_MARKDOWN
+    assert "TRIBE v2 lite-qv" in WORKFLOW_MERMAID_MARKDOWN
     assert "Update priors" in WORKFLOW_MERMAID_MARKDOWN
     assert "bc-workflow-row" in CSS
     assert "#workflow-accordion" in CSS
@@ -339,6 +344,12 @@ def test_workflow_accordion_uses_mermaid_markdown_and_requested_terms():
         "Decomposition",
         "Repair/Verify",
         "Canonicalization",
+        "CohereLabs/cohere-transcribe-03-2026",
+        "BAAI/bge-small-en-v1.5",
+        "prism-ml/bonsai-image-ternary-4B-gemlite-2bit",
+        "fancyfeast/joyquality-siglip2-so400m-512-16-05k047vn",
+        "openbmb/MiniCPM-V-4.6",
+        "Jessylg27/tribev2-lite-qv",
         "LHS",
         "Thompson Sampling/GP",
         "IQA",

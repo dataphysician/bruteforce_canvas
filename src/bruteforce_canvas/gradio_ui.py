@@ -80,19 +80,20 @@ LOCK_TABLE_HEADERS = ["Locked", "Field", "Raw", "Enum", "LHS policy", "Status"]
 GradioMode = Literal["simulation", "runtime"]
 WORKFLOW_MERMAID_CODE = """%%{init: {"theme": "base", "flowchart": {"htmlLabels": false}, "themeVariables": {"primaryColor": "#eef8f6", "primaryTextColor": "#17211f", "primaryBorderColor": "#0f766e", "secondaryColor": "#fff8e6", "tertiaryColor": "#ffffff", "lineColor": "#17211f", "fontFamily": "Inter, ui-sans-serif, system-ui, sans-serif", "fontSize": "14px"}}}%%
 flowchart TD
-  Mic["Microphone audio"] --> ASR["ASR transcript<br/>Cohere Transcribe path"]
+  Mic["Microphone audio"] --> ASR["Cohere Transcribe<br/>03-2026<br/>16 kHz en"]
   Typed["Typed prompt"] --> Prompt["Prompt text"]
   ASR --> Prompt
   Prompt --> Mellum["Mellum2 Thinking 12B<br/>via Modal Cloud<br/>structured JSON schemas"]
-  Mellum --> Parse["PromptDocument<br/>extraction<br/>canonicalize + verify"]
-  Parse --> Locks["Pre-run locks<br/>thresholds<br/>IQA >= 0.55<br/>Alignment >= 0.25<br/>Human IQA >= 0.70"]
-  Locks --> Coord["LHS coordinate<br/>coord_###<br/>compatibility + Bayesian<br/>score"]
-  Coord --> Seeds["5-seed batch<br/>[7, 42, 156]<br/>[8888, 42069]<br/>minimum bundle: 3"]
-  Seeds --> IQA{"JoyQuality IQA<br/>score >= 0.55?"}
+  Mellum --> Parse["PromptDocument<br/>extract + repair/verify"]
+  Parse --> Canon["BGE enum canonicalizer<br/>bge-small-en-v1.5<br/>threshold 0.62"]
+  Canon --> Locks["Pre-run locks<br/>thresholds<br/>IQA >= 0.55<br/>Alignment >= 0.25<br/>Human IQA >= 0.70"]
+  Locks --> Coord["LHS coordinate<br/>Thompson + GP<br/>Bayesian score"]
+  Coord --> Seeds["Bonsai Ternary 4B<br/>5-seed batch<br/>steps=4, 512x512"]
+  Seeds --> IQA{"JoyQuality SigLIP2<br/>score >= 0.55?"}
   IQA -- "fail" --> Persist["Persist candidate + failure evidence"]
-  IQA -- "pass" --> VLM{"MiniCPM-V alignment<br/>score >= 0.25?"}
+  IQA -- "pass" --> VLM{"MiniCPM-V-4.6<br/>alignment >= 0.25?"}
   VLM -- "fail" --> Persist
-  VLM -- "pass" --> Impact{"TRIBE impact enabled?<br/>optional cutoff"}
+  VLM -- "pass" --> Impact{"TRIBE v2 lite-qv<br/>disabled by default"}
   Impact -- "disabled or pass" --> Curated["Curated catalog<br/>fragile: 1 promoted<br/>viable: 2 promoted<br/>strong: >= 3 promoted"]
   Curated --> Feedback["Accept / reject / shred feedback"]
   Feedback --> Priors["Update priors<br/>enum arms alpha/beta<br/>enum-combo GP affinity"]
@@ -104,21 +105,23 @@ flowchart TD
   Stop -- "continue with updated priors" --> Coord
   classDef step fill:#eef8f6,stroke:#0f766e,color:#17211f
   classDef gate fill:#fff8e6,stroke:#a16207,color:#17211f
-  class Mic,ASR,Typed,Prompt,Mellum,Parse,Locks,Coord,Seeds,Persist,Curated,Feedback,Priors,End step
+  class Mic,ASR,Typed,Prompt,Mellum,Parse,Canon,Locks,Coord,Seeds,Persist,Curated,Feedback,Priors,End step
   class IQA,VLM,Impact,Stop gate"""
 WORKFLOW_MERMAID_MARKDOWN = f"```mermaid\n{WORKFLOW_MERMAID_CODE}\n```"
 WORKFLOW_EXPLANATION_MARKDOWN = """### Workflow Steps
 
-1. **Decomposition** extracts objects, relations, constraints, and cinematography lanes from typed text or ASR output.
-2. **Mellum2 Thinking 12B via Modal Cloud** supplies the structured JSON reasoning path for prompt extraction, repair, and verification.
-3. **Repair/Verify** checks blocking issues, unresolved targets, and threshold readiness before generation is allowed.
-4. **Canonicalization** maps raw prompt values to project enums and exposes lock or unlock controls for pre-run review.
-5. **LHS** proposes coverage-oriented coordinate rows across unlocked enum arms while preserving locked prompt evidence.
-6. **Thompson Sampling/GP** ranks sampled arms with Bayesian feedback state and can use GP-style coordinate scoring as evaluation evidence accumulates.
-7. **IQA** filters each 5-seed batch by JoyQuality against the configured quality cutoff.
-8. **VLM alignment** scores surviving images against the compiled prompt and target manifest.
-9. **TRIBE v2** remains disabled for now, but the impact gate is reserved for optional metacognitive scoring before catalog promotion.
-10. **Prior updates** write evaluation and feedback evidence back into enum-arm alpha/beta priors and enum-combination GP affinity for the next coordinate.
+1. **ASR / text input** accepts typed prompts or microphone audio. The local ASR path uses `CohereLabs/cohere-transcribe-03-2026`, normalizes to `16 kHz`, defaults to English punctuation, and decodes with `max_new_tokens=256`.
+2. **Decomposition** extracts objects, relations, constraints, and cinematography lanes from typed text or ASR output.
+3. **Mellum2 Thinking 12B via Modal Cloud** supplies the structured JSON reasoning path for prompt extraction, repair, and verification through an OpenAI-compatible endpoint using `temperature=0.0`, strict schema output, and `max_completion_tokens=2048`.
+4. **Repair/Verify** checks blocking issues, unresolved targets, and threshold readiness before generation is allowed.
+5. **Canonicalization** maps raw prompt values to project enums with `BAAI/bge-small-en-v1.5`, `match_threshold=0.62`, and LLM fallback for uncertain matches.
+6. **LHS** proposes coverage-oriented coordinate rows across unlocked enum arms while preserving locked prompt evidence.
+7. **Thompson Sampling/GP** ranks sampled arms with Bayesian feedback state, GP-style coordinate scoring, and compatibility priors as evaluation evidence accumulates.
+8. **Quick generation** uses `prism-ml/bonsai-image-ternary-4B-gemlite-2bit` through Bonsai local or HTTP adapters, with the fast preview path defaulting to `steps=4`, `512x512`, and seeds `[7, 42, 156, 8888, 42069]`.
+9. **IQA** filters each 5-seed batch with `fancyfeast/joyquality-siglip2-so400m-512-16-05k047vn` against the configured quality cutoff.
+10. **VLM alignment** scores surviving images with `openbmb/MiniCPM-V-4.6`, `max_new_tokens=128`, and the compiled prompt/target manifest.
+11. **TRIBE v2** uses `Jessylg27/tribev2-lite-qv` as an optional metacognitive impact adapter; it is disabled by default and kept downstream of IQA and VLM gates.
+12. **Prior updates** write evaluation and feedback evidence back into enum-arm alpha/beta priors and enum-combination GP affinity for the next coordinate.
 """
 
 
