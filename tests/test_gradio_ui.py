@@ -1,3 +1,6 @@
+import sys
+from types import SimpleNamespace
+
 import pytest
 
 gr = pytest.importorskip("gradio")
@@ -9,6 +12,8 @@ from bruteforce_canvas.gradio_ui import (
     _runtime_fixed_arms,
     WORKFLOW_EXPLANATION_MARKDOWN,
     WORKFLOW_MERMAID_MARKDOWN,
+    _maybe_zero_gpu,
+    _zero_gpu_callbacks_enabled,
     build_demo,
     build_prompt_document_for_demo,
     generate_seed_sweep,
@@ -191,6 +196,63 @@ def test_runtime_blocks_app_constructs_without_launching():
     demo = build_demo(mode="runtime")
 
     assert isinstance(demo, gr.Blocks)
+
+
+def test_zero_gpu_metadata_is_declared_for_space():
+    readme = open("README.md", encoding="utf-8").read()
+    requirements = open("requirements.txt", encoding="utf-8").read()
+
+    assert "suggested_hardware: zero-a10g" in readme
+    assert "spaces>=" in requirements
+
+
+def test_zero_gpu_wrapper_is_optional_without_spaces(monkeypatch):
+    def function():
+        return "ok"
+
+    monkeypatch.delenv("BC_ZEROGPU_CALLBACKS", raising=False)
+    monkeypatch.setitem(sys.modules, "spaces", None)
+
+    assert _zero_gpu_callbacks_enabled() is True
+    assert _maybe_zero_gpu(function, duration=5) is function
+
+
+def test_zero_gpu_wrapper_uses_spaces_gpu_when_available(monkeypatch):
+    calls = []
+
+    def fake_gpu(*, duration):
+        calls.append(duration)
+
+        def decorator(function):
+            def wrapped(*args, **kwargs):
+                return function(*args, **kwargs)
+
+            wrapped._zero_gpu_wrapped = True
+            return wrapped
+
+        return decorator
+
+    def function():
+        return "ok"
+
+    monkeypatch.delenv("BC_ZEROGPU_CALLBACKS", raising=False)
+    monkeypatch.setitem(sys.modules, "spaces", SimpleNamespace(GPU=fake_gpu))
+
+    wrapped = _maybe_zero_gpu(function, duration=17)
+
+    assert calls == [17]
+    assert wrapped() == "ok"
+    assert wrapped._zero_gpu_wrapped is True
+
+
+def test_zero_gpu_wrapper_can_be_disabled(monkeypatch):
+    def function():
+        return "ok"
+
+    monkeypatch.setenv("BC_ZEROGPU_CALLBACKS", "false")
+
+    assert _zero_gpu_callbacks_enabled() is False
+    assert _maybe_zero_gpu(function, duration=5) is function
 
 
 def test_runtime_lock_rows_keep_only_locked_values():

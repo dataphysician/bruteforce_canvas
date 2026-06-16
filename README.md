@@ -5,7 +5,7 @@ sdk: gradio
 sdk_version: 6.18.0
 python_version: 3.12
 app_file: app.py
-suggested_hardware: l4x1
+suggested_hardware: zero-a10g
 tags:
   - track:backyard
   - track:wood
@@ -134,6 +134,8 @@ export BC_ALIGNMENT_CUTOFF=0.25
 export BC_IMPACT_ENABLED=false
 export BC_EVENT_STORE=runtime/events.jsonl
 ```
+
+On Hugging Face Spaces, the Space is configured for ZeroGPU with `suggested_hardware: zero-a10g`. The Gradio UI wraps the GPU-capable microphone transcription and runtime generation callbacks with `spaces.GPU` when the `spaces` package is available. Set `BC_ZEROGPU_CALLBACKS=false` only for local debugging when the callback wrapper should be bypassed.
 
 Keep the Bonsai backend outside this repository. Clone and install the external Bonsai Image Demo backend in a separate directory, then point this app at the directory that contains `backend_gpu/server.py`. Model weights can live under `BC_BONSAI_MODEL_ROOT`, or the backend can resolve `prism-ml/bonsai-image-ternary-4B-gemlite-2bit` through the Hugging Face cache when the local model directory does not exist.
 

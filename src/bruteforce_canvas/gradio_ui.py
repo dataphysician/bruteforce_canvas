@@ -948,6 +948,23 @@ def _resolve_gradio_mode(mode: GradioMode | str | None = None) -> GradioMode:
     return requested  # type: ignore[return-value]
 
 
+def _zero_gpu_callbacks_enabled() -> bool:
+    return os.environ.get("BC_ZEROGPU_CALLBACKS", "auto").lower() not in {"0", "false", "no", "off"}
+
+
+def _maybe_zero_gpu(function: Any, *, duration: int) -> Any:
+    if not _zero_gpu_callbacks_enabled():
+        return function
+    try:
+        import spaces
+    except Exception:
+        return function
+    gpu = getattr(spaces, "GPU", None)
+    if gpu is None:
+        return function
+    return gpu(duration=duration)(function)
+
+
 def _new_runtime_run_id() -> str:
     return f"run_{int(time.time() * 1000)}"
 
@@ -2632,6 +2649,11 @@ def build_demo(mode: GradioMode | str | None = None) -> gr.Blocks:
     cancel_handler = cancel_pre_run_runtime if resolved_mode == "runtime" else cancel_pre_run
     generate_handler = generate_seed_sweep_runtime if resolved_mode == "runtime" else generate_seed_sweep
     feedback_handler = submit_feedback_runtime if resolved_mode == "runtime" else submit_feedback
+    start_event_handler = _maybe_zero_gpu(start_handler, duration=180) if resolved_mode == "runtime" else start_handler
+    generate_event_handler = (
+        _maybe_zero_gpu(generate_handler, duration=900) if resolved_mode == "runtime" else generate_handler
+    )
+    microphone_event_handler = _maybe_zero_gpu(transcribe_microphone_to_prompt_steps, duration=180)
 
     with gr.Blocks(
         title="Bruteforce Canvas",
@@ -2731,24 +2753,24 @@ def build_demo(mode: GradioMode | str | None = None) -> gr.Blocks:
                         trash_btn = gr.Button("Trash", size="sm", variant="stop")
 
             submit.click(
-                start_handler,
+                start_event_handler,
                 inputs=[prompt, state],
                 outputs=[state, review_panel, parsed_report, lock_table, generate, status],
             )
             prompt.submit(
-                start_handler,
+                start_event_handler,
                 inputs=[prompt, state],
                 outputs=[state, review_panel, parsed_report, lock_table, generate, status],
             )
             microphone.change(
-                transcribe_microphone_to_prompt_steps,
+                microphone_event_handler,
                 inputs=[microphone, prompt, state],
                 outputs=[prompt, state, status],
                 show_progress="minimal",
             )
             cancel.click(cancel_handler, inputs=[state], outputs=[state, review_panel, generate, status])
             generate.click(
-                generate_handler,
+                generate_event_handler,
                 inputs=[state, lock_table, iqa_cutoff, alignment_cutoff],
                 outputs=[
                     state,
